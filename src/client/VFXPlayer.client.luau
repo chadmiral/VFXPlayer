@@ -15,6 +15,8 @@ local function PlaySequence(s)
     newSeq.duration = s:GetAttribute("Duration")
     newSeq.looping = s:GetAttribute("Looping")
 
+    newSeq:Init()
+
     table.insert(activeSequences, newSeq)
 end
 
@@ -29,15 +31,16 @@ end
 
 local function OnHeartbeat(dt)
     local timeStamp = time()
-    local i = 1
-    for _,s in activeSequences do
+    for i = 1, #activeSequences, 1 do
+        local s = activeSequences[i]
         local elapsedTime = timeStamp - s.startTime
         
         --print("ElapsedTime: "..elapsedTime)
         if elapsedTime > s.duration then
-            print("Sequence "..s.model.Name.." has elapsed!")
+            --print("Sequence "..s.model.Name.." has elapsed!")
             if s.looping then
                 s.startTime = time()
+                s:Init()
             else
                 table.remove(activeSequences, i)
                 i -= 1
