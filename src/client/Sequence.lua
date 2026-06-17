@@ -21,12 +21,17 @@ local function initParticleEmitter(e)
     pd.baseRate = e.Rate
     pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
 
+    pd.baseColor = e.Color
+    pd.tintOverDuration = e:GetAttribute("TintOverDuration")
+
     return pd
 end
 
+--reset all playing emitters to their starting states
 function Sequence:resetParticleDrivers()
     for _,pd in self.particleDrivers do
         pd.emitter.Rate = pd.baseRate
+        pd.emitter.Color = pd.baseColor
     end
 end
 
