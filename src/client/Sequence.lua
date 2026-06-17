@@ -18,11 +18,15 @@ local function initParticleEmitter(e)
 
     local pd = ParticleDriver:new()
     pd.emitter = e
+
     pd.baseRate = e.Rate
     pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
 
     pd.baseColor = e.Color
     pd.tintOverDuration = e:GetAttribute("TintOverDuration")
+
+    pd.baseTransparency = e.Transparency
+    pd.transparencyScaleOverDuration = e:GetAttribute("TransparencyScaleOverDuration")
 
     return pd
 end
@@ -32,6 +36,7 @@ function Sequence:resetParticleDrivers()
     for _,pd in self.particleDrivers do
         pd.emitter.Rate = pd.baseRate
         pd.emitter.Color = pd.baseColor
+        pd.emitter.Transparency = pd.baseTransparency
     end
 end
 

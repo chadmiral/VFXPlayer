@@ -2,10 +2,15 @@ ParticleDriver = {
     name = "ParticleDriver",
     _type = "ParticleDriver",
     emitter = nil,
+
     baseRate = nil,
     emissionScaleOverDuration = nil,
+
+    baseTransparency = nil,
+    transparencyScaleOverDuration = nil,
+    
     baseColor = nil,
-    tintOverDuration = nil
+    tintOverDuration = nil,
 }
 
 local Utility = require(script.Parent:WaitForChild("Utility"))
@@ -23,6 +28,17 @@ function ParticleDriver:Update(t)
         self.emitter.Rate = self.baseRate * rateScale
     end
 
+    if self.transparencyScaleOverDuration ~= nil then
+        local transScale = Utility.EvalNumberSequence(self.transparencyScaleOverDuration, t)
+
+        local newKeypoints = {}
+        for i = 1, #self.baseTransparency.Keypoints do
+            local kpTrans = self.baseTransparency.Keypoints[i].Value
+            table.insert(newKeypoints, NumberSequenceKeypoint.new(self.baseTransparency.Keypoints[i].Time, kpTrans * transScale))
+        end
+        self.emitter.Transparency = NumberSequence.new(newKeypoints)
+    end
+
     if self.tintOverDuration ~= nil then
         local tint = Utility.EvalColorSequence(self.tintOverDuration, t)
 
@@ -33,6 +49,8 @@ function ParticleDriver:Update(t)
         end
         self.emitter.Color = ColorSequence.new(newKeypoints)
     end
+
+
 end
 
 return ParticleDriver
