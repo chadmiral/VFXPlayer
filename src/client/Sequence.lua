@@ -11,11 +11,6 @@ function Sequence:new(o)
 end
 
 local function initParticleEmitter(seq, e)
-    local burstCount = e:GetAttribute("BurstCount")
-    if burstCount ~= nil then 
-        e:Emit(burstCount)
-    end
-
     local pd = ParticleDriver:new()
     pd.emitter = e
 
@@ -24,6 +19,10 @@ local function initParticleEmitter(seq, e)
         pd.duration = seq.duration
     end
     pd.delay = e:GetAttribute("Delay")
+    if pd.delay == nil then
+        pd.delay = 0
+    end
+    pd.burstCount = e:GetAttribute("BurstCount")
 
     pd.baseRate = e.Rate
     pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
@@ -33,6 +32,8 @@ local function initParticleEmitter(seq, e)
 
     pd.baseTransparency = e.Transparency
     pd.transparencyScaleOverDuration = e:GetAttribute("TransparencyScaleOverDuration")
+
+    pd:BeginCycle()
 
     return pd
 end
@@ -48,6 +49,7 @@ end
 
 function Sequence:Init()
     resetParticleDrivers(self)
+    self.particleDrivers = {}
 
     local descendants = self.model:GetDescendants()
     for _,d in descendants do
@@ -59,11 +61,8 @@ function Sequence:Init()
 end
 
 function Sequence:Update(elapsedTime)
-    local t = elapsedTime / self.duration
-    --print("Updating sequence "..self.model.Name.." elapsedTime: "..elapsedTime.." t: "..t)
-
     for _,pd in self.particleDrivers do
-        pd:Update(t)
+        pd:Update(elapsedTime)
     end
 end
 

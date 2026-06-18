@@ -31,24 +31,25 @@ end
 
 local function OnHeartbeat(dt)
     local timeStamp = time()
-    for i = 1, #activeSequences, 1 do
+    local i = 1
+    while i <= #activeSequences do
         local s = activeSequences[i]
         local elapsedTime = timeStamp - s.startTime
-        
+
         --print("ElapsedTime: "..elapsedTime)
         if elapsedTime > s.duration then
             --print("Sequence "..s.model.Name.." has elapsed!")
             if s.looping then
                 s.startTime = time()
                 s:Init()
+                i += 1
             else
                 table.remove(activeSequences, i)
-                i -= 1
             end
         else
             s:Update(elapsedTime)
+            i += 1
         end
-        i += 1
     end
 end
 
