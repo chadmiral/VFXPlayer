@@ -10,7 +10,7 @@ function Sequence:new(o)
     return o
 end
 
-local function initParticleEmitter(e)
+local function initParticleEmitter(seq, e)
     local burstCount = e:GetAttribute("BurstCount")
     if burstCount ~= nil then 
         e:Emit(burstCount)
@@ -18,6 +18,12 @@ local function initParticleEmitter(e)
 
     local pd = ParticleDriver:new()
     pd.emitter = e
+
+    pd.duration = e:GetAttribute("Duration")
+    if pd.duration == nil then
+        pd.duration = seq.duration
+    end
+    pd.delay = e:GetAttribute("Delay")
 
     pd.baseRate = e.Rate
     pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
@@ -32,8 +38,8 @@ local function initParticleEmitter(e)
 end
 
 --reset all playing emitters to their starting states
-function Sequence:resetParticleDrivers()
-    for _,pd in self.particleDrivers do
+local function resetParticleDrivers(seq)
+    for _,pd in seq.particleDrivers do
         pd.emitter.Rate = pd.baseRate
         pd.emitter.Color = pd.baseColor
         pd.emitter.Transparency = pd.baseTransparency
@@ -41,12 +47,12 @@ function Sequence:resetParticleDrivers()
 end
 
 function Sequence:Init()
-    self:resetParticleDrivers()
+    resetParticleDrivers(self)
 
     local descendants = self.model:GetDescendants()
     for _,d in descendants do
         if d:IsA("ParticleEmitter") then
-            local pd = initParticleEmitter(d)
+            local pd = initParticleEmitter(self, d)
             table.insert(self.particleDrivers, pd)
         end
     end

@@ -2,6 +2,8 @@ ParticleDriver = {
     name = "ParticleDriver",
     _type = "ParticleDriver",
     emitter = nil,
+    duration = nil,
+    delay = nil,
 
     baseRate = nil,
     emissionScaleOverDuration = nil,
@@ -49,8 +51,6 @@ function ParticleDriver:Update(t)
         end
         self.emitter.Color = ColorSequence.new(newKeypoints)
     end
-
-
 end
 
 return ParticleDriver
