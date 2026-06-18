@@ -54,4 +54,5 @@ local function OnHeartbeat(dt)
 end
 
 RunService.Heartbeat:Connect(OnHeartbeat)
+wait(1)
 Init()
