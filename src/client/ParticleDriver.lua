@@ -11,6 +11,18 @@ ParticleDriver = {
     baseRate = nil,
     emissionScaleOverDuration = nil,
 
+    baseBrightness = nil,
+    brightnessScaleOverDuration = nil,
+
+    baseLightEmission = nil,
+    lightEmissionScaleOverDuration = nil,
+
+    baseLightInfluence = nil,
+    lightInfluenceScaleOverDuration = nil,
+
+    baseSize = nil,
+    sizeScaleOverDuration = nil,
+
     baseTransparency = nil,
     transparencyScaleOverDuration = nil,
     
@@ -30,6 +42,10 @@ end
 --restore the emitter to its starting state and suppress emission during the delay window
 function ParticleDriver:HoldAtStart()
     self.emitter.Rate = 0
+    self.emitter.Brightness = self.baseBrightness
+    self.emitter.LightEmission = self.baseLightEmission
+    self.emitter.LightInfluence = self.baseLightInfluence
+    self.emitter.Size = self.baseSize
     self.emitter.Color = self.baseColor
     self.emitter.Transparency = self.baseTransparency
 end
@@ -46,6 +62,38 @@ function ParticleDriver:ApplyCurves(t)
         self.emitter.Rate = self.baseRate * rateScale
     else
         self.emitter.Rate = self.baseRate
+    end
+
+    if self.brightnessScaleOverDuration ~= nil then
+        local brightnessScale = Utility.EvalNumberSequence(self.brightnessScaleOverDuration, t)
+        self.emitter.Brightness = self.baseBrightness * brightnessScale
+    else
+        self.emitter.Brightness = self.baseBrightness
+    end
+
+    if self.lightEmissionScaleOverDuration ~= nil then
+        local lightEmissionScale = Utility.EvalNumberSequence(self.lightEmissionScaleOverDuration, t)
+        self.emitter.LightEmission = self.baseLightEmission * lightEmissionScale
+    else
+        self.emitter.LightEmission = self.baseLightEmission
+    end
+
+    if self.lightInfluenceScaleOverDuration ~= nil then
+        local lightInfluenceScale = Utility.EvalNumberSequence(self.lightInfluenceScaleOverDuration, t)
+        self.emitter.LightInfluence = self.baseLightInfluence * lightInfluenceScale
+    else
+        self.emitter.LightInfluence = self.baseLightInfluence
+    end
+
+    if self.sizeScaleOverDuration ~= nil then
+        local sizeScale = Utility.EvalNumberSequence(self.sizeScaleOverDuration, t)
+
+        local newKeypoints = {}
+        for i = 1, #self.baseSize.Keypoints do
+            local kpSize = self.baseSize.Keypoints[i].Value
+            table.insert(newKeypoints, NumberSequenceKeypoint.new(self.baseSize.Keypoints[i].Time, kpSize * sizeScale))
+        end
+        self.emitter.Size = NumberSequence.new(newKeypoints)
     end
 
     if self.transparencyScaleOverDuration ~= nil then

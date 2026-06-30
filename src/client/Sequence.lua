@@ -28,6 +28,18 @@ local function initParticleEmitter(seq, e)
     pd.baseRate = e.Rate
     pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
 
+    pd.baseBrightness = e.Brightness
+    pd.brightnessScaleOverDuration = e:GetAttribute("BrightnessScaleOverDuration")
+
+    pd.baseLightEmission = e.LightEmission
+    pd.lightEmissionScaleOverDuration = e:GetAttribute("LightEmissionScaleOverDuration")
+
+    pd.baseLightInfluence = e.LightInfluence
+    pd.lightInfluenceScaleOverDuration = e:GetAttribute("LightInfluenceScaleOverDuration")
+
+    pd.baseSize = e.Size
+    pd.sizeScaleOverDuration = e:GetAttribute("SizeScaleOverDuration")
+
     pd.baseColor = e.Color
     pd.tintOverDuration = e:GetAttribute("TintOverDuration")
 
@@ -76,6 +88,10 @@ end
 local function resetParticleDrivers(seq)
     for _,pd in seq.particleDrivers do
         pd.emitter.Rate = pd.baseRate
+        pd.emitter.Brightness = pd.baseBrightness
+        pd.emitter.LightEmission = pd.baseLightEmission
+        pd.emitter.LightInfluence = pd.baseLightInfluence
+        pd.emitter.Size = pd.baseSize
         pd.emitter.Color = pd.baseColor
         pd.emitter.Transparency = pd.baseTransparency
     end
