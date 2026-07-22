@@ -17,9 +17,18 @@ ParticleDriver = {
     baseSize = nil,
     baseTransparency = nil,
     baseColor = nil,
+
+    -- distance-based fade bounds in studs, derived from the FadeDistance
+    -- NumberRange attribute (Min -> fadeStart, Max -> fadeEnd)
+    fadeStart = nil,
+    fadeEnd = nil,
+    -- authored Enabled state, restored when the emitter is within FadeEnd
+    baseEnabled = true,
 }
 
 local Utility = require(script.Parent:WaitForChild("Utility"))
+
+local Workspace = game:GetService("Workspace")
 
 function ParticleDriver:new(o)
     o = o or {}
@@ -28,15 +37,58 @@ function ParticleDriver:new(o)
     return o
 end
 
+--world position of the emitter, derived from its parent (BasePart or Attachment)
+local function getEmitterWorldPosition(emitter)
+    local parent = emitter.Parent
+    if parent == nil then
+        return nil
+    end
+    if parent:IsA("Attachment") then
+        return parent.WorldPosition
+    elseif parent:IsA("BasePart") then
+        return parent.Position
+    end
+    return nil
+end
+
+--compute the distance-based fade for this frame.
+--returns `alpha, distance`:
+--  * alpha    -> transparency fade in [0, 1] (0 = fully visible, 1 = faded out)
+--  * distance -> camera-to-emitter distance in studs, or nil when the fade is
+--                inactive (parameters unset, or no camera / position available)
+function ParticleDriver:ComputeFade()
+    if self.fadeStart == nil or self.fadeEnd == nil then
+        return 0, nil
+    end
+
+    local camera = Workspace.CurrentCamera
+    local position = getEmitterWorldPosition(self.emitter)
+    if camera == nil or position == nil then
+        return 0, nil
+    end
+
+    local distance = (camera.CFrame.Position - position).Magnitude
+
+    local alpha
+    if self.fadeEnd <= self.fadeStart then
+        -- degenerate range: treat as a hard cutoff at fadeEnd
+        alpha = distance >= self.fadeEnd and 1 or 0
+    else
+        alpha = math.clamp((distance - self.fadeStart) / (self.fadeEnd - self.fadeStart), 0, 1)
+    end
+
+    return alpha, distance
+end
+
 --restore the emitter to its starting state and suppress emission during the delay window
-function ParticleDriver:HoldAtStart()
+function ParticleDriver:HoldAtStart(fadeAlpha)
     self.emitter.Rate = 0
     self.emitter.Brightness = self.baseBrightness
     self.emitter.LightEmission = self.baseLightEmission
     self.emitter.LightInfluence = self.baseLightInfluence
     self.emitter.Size = self.baseSize
     self.emitter.Color = self.baseColor
-    self.emitter.Transparency = self.baseTransparency
+    self.emitter.Transparency = Utility.FadeNumberSequence(self.baseTransparency, fadeAlpha or 0)
 end
 
 --reset per-cycle state at the start of a sequence or loop
@@ -50,7 +102,9 @@ end
 --when `suppressEmission` is true (a stage has elapsed and we are holding), the
 --emission Rate is forced to 0 so no new particles spawn, while every other
 --property stays frozen at its held value and already-spawned particles live on.
-function ParticleDriver:ApplyCurves(curves, t, suppressEmission)
+--`fadeAlpha` (0-1) is the distance-based transparency fade layered on top of the
+--stage's transparency.
+function ParticleDriver:ApplyCurves(curves, t, suppressEmission, fadeAlpha)
     if suppressEmission then
         self.emitter.Rate = 0
     elseif curves.emissionScaleOverDuration ~= nil then
@@ -88,12 +142,14 @@ function ParticleDriver:ApplyCurves(curves, t, suppressEmission)
         self.emitter.Size = self.baseSize
     end
 
+    local stageTransparency
     if curves.transparencyScaleOverDuration ~= nil then
         local transScale = Utility.EvalNumberSequence(curves.transparencyScaleOverDuration, t)
-        self.emitter.Transparency = Utility.ScaleNumberSequence(self.baseTransparency, transScale)
+        stageTransparency = Utility.ScaleNumberSequence(self.baseTransparency, transScale)
     else
-        self.emitter.Transparency = self.baseTransparency
+        stageTransparency = self.baseTransparency
     end
+    self.emitter.Transparency = Utility.FadeNumberSequence(stageTransparency, fadeAlpha or 0)
 
     if curves.tintOverDuration ~= nil then
         local tint = Utility.EvalColorSequence(curves.tintOverDuration, t)
@@ -104,14 +160,21 @@ function ParticleDriver:ApplyCurves(curves, t, suppressEmission)
 end
 
 function ParticleDriver:Update(elapsedTime)
+    local fadeAlpha, distance = self:ComputeFade()
+
+    -- distance culling: turn emission off past FadeEnd, back on within FadeEnd
+    if distance ~= nil then
+        self.emitter.Enabled = self.baseEnabled and distance <= self.fadeEnd
+    end
+
     if self.timeline == nil or #self.timeline == 0 then
-        self:HoldAtStart()
+        self:HoldAtStart(fadeAlpha)
         return
     end
 
     local curves, t, active, frozen, entry = Utility.ResolveTimeline(self.timeline, elapsedTime)
     if not active or curves == nil then
-        self:HoldAtStart()
+        self:HoldAtStart(fadeAlpha)
         return
     end
 
@@ -124,7 +187,7 @@ function ParticleDriver:Update(elapsedTime)
         self.lastBurstEntry = entry
     end
 
-    self:ApplyCurves(curves, t, frozen)
+    self:ApplyCurves(curves, t, frozen, fadeAlpha)
 end
 
 return ParticleDriver

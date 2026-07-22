@@ -56,6 +56,25 @@ function Utility.ScaleNumberSequence(sequence: NumberSequence, scale: number)
     return NumberSequence.new(newKeypoints)
 end
 
+-- Fade a transparency NumberSequence toward fully transparent (1) by `alpha`,
+-- clamped to [0, 1]. alpha = 0 leaves the sequence unchanged; alpha = 1 makes
+-- every keypoint fully transparent. Each value v becomes v + (1 - v) * alpha,
+-- which composes as a straight multiply on the particles' opacity.
+function Utility.FadeNumberSequence(sequence: NumberSequence, alpha: number)
+    if alpha <= 0 then
+        return sequence
+    end
+    if alpha > 1 then
+        alpha = 1
+    end
+    local newKeypoints = {}
+    for i = 1, #sequence.Keypoints do
+        local kp = sequence.Keypoints[i]
+        table.insert(newKeypoints, NumberSequenceKeypoint.new(kp.Time, kp.Value + (1 - kp.Value) * alpha))
+    end
+    return NumberSequence.new(newKeypoints)
+end
+
 -- Multiply every keypoint of a ColorSequence by a tint color (per RGB channel).
 function Utility.TintColorSequence(sequence: ColorSequence, tint: Color3)
     local newKeypoints = {}

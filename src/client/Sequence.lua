@@ -85,6 +85,13 @@ local function initParticleEmitter(seq, e)
     pd.baseSize = e.Size
     pd.baseColor = e.Color
     pd.baseTransparency = e.Transparency
+    pd.baseEnabled = e.Enabled
+
+    local fadeDistance = e:GetAttribute("FadeDistance")
+    if fadeDistance ~= nil then
+        pd.fadeStart = fadeDistance.Min
+        pd.fadeEnd = fadeDistance.Max
+    end
 
     local stages = buildStages(e, seq.duration, readParticleStageCurves)
     pd.timeline = Utility.BuildTimeline(stages)
@@ -124,6 +131,7 @@ local function resetParticleDrivers(seq)
         pd.emitter.Size = pd.baseSize
         pd.emitter.Color = pd.baseColor
         pd.emitter.Transparency = pd.baseTransparency
+        pd.emitter.Enabled = pd.baseEnabled
     end
 end
 
