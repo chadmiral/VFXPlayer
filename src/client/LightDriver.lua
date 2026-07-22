@@ -2,22 +2,16 @@ LightDriver = {
     name = "LightDriver",
     _type = "LightDriver",
     light = nil,
-    duration = nil,
-    delay = nil,
 
     isSpotLight = false,
 
+    -- ordered stage timeline (stand -> hold -> decay); see Utility.BuildTimeline
+    timeline = nil,
+
     baseBrightness = nil,
-    brightnessScaleOverDuration = nil,
-
     baseRange = nil,
-    rangeScaleOverDuration = nil,
-
     baseAngle = nil,
-    angleScaleOverDuration = nil,
-
     baseColor = nil,
-    tintOverDuration = nil,
 }
 
 local Utility = require(script.Parent:WaitForChild("Utility"))
@@ -44,45 +38,53 @@ function LightDriver:BeginCycle()
     self:HoldAtStart()
 end
 
-function LightDriver:ApplyCurves(t)
-    if self.brightnessScaleOverDuration ~= nil then
-        local brightnessScale = Utility.EvalNumberSequence(self.brightnessScaleOverDuration, t)
+--apply a single stage's curve set at normalized time t; properties whose curve
+--is absent for this stage fall back to the light's base value
+function LightDriver:ApplyCurves(curves, t)
+    if curves.brightnessScaleOverDuration ~= nil then
+        local brightnessScale = Utility.EvalNumberSequence(curves.brightnessScaleOverDuration, t)
         self.light.Brightness = self.baseBrightness * brightnessScale
     else
         self.light.Brightness = self.baseBrightness
     end
 
-    if self.rangeScaleOverDuration ~= nil then
-        local rangeScale = Utility.EvalNumberSequence(self.rangeScaleOverDuration, t)
+    if curves.rangeScaleOverDuration ~= nil then
+        local rangeScale = Utility.EvalNumberSequence(curves.rangeScaleOverDuration, t)
         self.light.Range = self.baseRange * rangeScale
+    else
+        self.light.Range = self.baseRange
     end
 
-    if self.isSpotLight and self.angleScaleOverDuration ~= nil then
-        local angleScale = Utility.EvalNumberSequence(self.angleScaleOverDuration, t)
-        self.light.Angle = self.baseAngle * angleScale
+    if self.isSpotLight then
+        if curves.angleScaleOverDuration ~= nil then
+            local angleScale = Utility.EvalNumberSequence(curves.angleScaleOverDuration, t)
+            self.light.Angle = self.baseAngle * angleScale
+        else
+            self.light.Angle = self.baseAngle
+        end
     end
 
-    if self.tintOverDuration ~= nil then
-        local tint = Utility.EvalColorSequence(self.tintOverDuration, t)
+    if curves.tintOverDuration ~= nil then
+        local tint = Utility.EvalColorSequence(curves.tintOverDuration, t)
         self.light.Color = Color3.new(self.baseColor.R * tint.R, self.baseColor.G * tint.G, self.baseColor.B * tint.B)
+    else
+        self.light.Color = self.baseColor
     end
 end
 
 function LightDriver:Update(elapsedTime)
-    local delay = self.delay or 0
-    if elapsedTime < delay then
+    if self.timeline == nil or #self.timeline == 0 then
         self:HoldAtStart()
         return
     end
 
-    local duration = self.duration
-    if duration == nil or duration <= 0 then
+    local curves, t, active = Utility.ResolveTimeline(self.timeline, elapsedTime)
+    if not active or curves == nil then
+        self:HoldAtStart()
         return
     end
 
-    local localElapsed = elapsedTime - delay
-    local t = math.clamp(localElapsed / duration, 0, 1)
-    self:ApplyCurves(t)
+    self:ApplyCurves(curves, t)
 end
 
 return LightDriver

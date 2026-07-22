@@ -2,32 +2,21 @@ ParticleDriver = {
     name = "ParticleDriver",
     _type = "ParticleDriver",
     emitter = nil,
-    duration = nil,
-    delay = nil,
 
-    burstCount = nil,
-    burstFired = false,
+    -- ordered stage timeline (stand -> hold -> decay); see Utility.BuildTimeline
+    timeline = nil,
+
+    -- tracks the stage entry whose burst was last emitted, so each stage fires
+    -- its burst exactly once (even while the Hold stage loops)
+    lastBurstEntry = nil,
 
     baseRate = nil,
-    emissionScaleOverDuration = nil,
-
     baseBrightness = nil,
-    brightnessScaleOverDuration = nil,
-
     baseLightEmission = nil,
-    lightEmissionScaleOverDuration = nil,
-
     baseLightInfluence = nil,
-    lightInfluenceScaleOverDuration = nil,
-
     baseSize = nil,
-    sizeScaleOverDuration = nil,
-
     baseTransparency = nil,
-    transparencyScaleOverDuration = nil,
-    
     baseColor = nil,
-    tintOverDuration = nil,
 }
 
 local Utility = require(script.Parent:WaitForChild("Utility"))
@@ -52,93 +41,90 @@ end
 
 --reset per-cycle state at the start of a sequence or loop
 function ParticleDriver:BeginCycle()
-    self.burstFired = false
+    self.lastBurstEntry = nil
     self:HoldAtStart()
 end
 
-function ParticleDriver:ApplyCurves(t)
-    if self.emissionScaleOverDuration ~= nil then
-        local rateScale = Utility.EvalNumberSequence(self.emissionScaleOverDuration, t)
+--apply a single stage's curve set at normalized time t; properties whose curve
+--is absent for this stage fall back to the emitter's base value.
+--when `suppressEmission` is true (a stage has elapsed and we are holding), the
+--emission Rate is forced to 0 so no new particles spawn, while every other
+--property stays frozen at its held value and already-spawned particles live on.
+function ParticleDriver:ApplyCurves(curves, t, suppressEmission)
+    if suppressEmission then
+        self.emitter.Rate = 0
+    elseif curves.emissionScaleOverDuration ~= nil then
+        local rateScale = Utility.EvalNumberSequence(curves.emissionScaleOverDuration, t)
         self.emitter.Rate = self.baseRate * rateScale
     else
         self.emitter.Rate = self.baseRate
     end
 
-    if self.brightnessScaleOverDuration ~= nil then
-        local brightnessScale = Utility.EvalNumberSequence(self.brightnessScaleOverDuration, t)
+    if curves.brightnessScaleOverDuration ~= nil then
+        local brightnessScale = Utility.EvalNumberSequence(curves.brightnessScaleOverDuration, t)
         self.emitter.Brightness = self.baseBrightness * brightnessScale
     else
         self.emitter.Brightness = self.baseBrightness
     end
 
-    if self.lightEmissionScaleOverDuration ~= nil then
-        local lightEmissionScale = Utility.EvalNumberSequence(self.lightEmissionScaleOverDuration, t)
+    if curves.lightEmissionScaleOverDuration ~= nil then
+        local lightEmissionScale = Utility.EvalNumberSequence(curves.lightEmissionScaleOverDuration, t)
         self.emitter.LightEmission = self.baseLightEmission * lightEmissionScale
     else
         self.emitter.LightEmission = self.baseLightEmission
     end
 
-    if self.lightInfluenceScaleOverDuration ~= nil then
-        local lightInfluenceScale = Utility.EvalNumberSequence(self.lightInfluenceScaleOverDuration, t)
+    if curves.lightInfluenceScaleOverDuration ~= nil then
+        local lightInfluenceScale = Utility.EvalNumberSequence(curves.lightInfluenceScaleOverDuration, t)
         self.emitter.LightInfluence = self.baseLightInfluence * lightInfluenceScale
     else
         self.emitter.LightInfluence = self.baseLightInfluence
     end
 
-    if self.sizeScaleOverDuration ~= nil then
-        local sizeScale = Utility.EvalNumberSequence(self.sizeScaleOverDuration, t)
-
-        local newKeypoints = {}
-        for i = 1, #self.baseSize.Keypoints do
-            local kpSize = self.baseSize.Keypoints[i].Value
-            table.insert(newKeypoints, NumberSequenceKeypoint.new(self.baseSize.Keypoints[i].Time, kpSize * sizeScale))
-        end
-        self.emitter.Size = NumberSequence.new(newKeypoints)
+    if curves.sizeScaleOverDuration ~= nil then
+        local sizeScale = Utility.EvalNumberSequence(curves.sizeScaleOverDuration, t)
+        self.emitter.Size = Utility.ScaleNumberSequence(self.baseSize, sizeScale)
+    else
+        self.emitter.Size = self.baseSize
     end
 
-    if self.transparencyScaleOverDuration ~= nil then
-        local transScale = Utility.EvalNumberSequence(self.transparencyScaleOverDuration, t)
-
-        local newKeypoints = {}
-        for i = 1, #self.baseTransparency.Keypoints do
-            local kpTrans = self.baseTransparency.Keypoints[i].Value
-            table.insert(newKeypoints, NumberSequenceKeypoint.new(self.baseTransparency.Keypoints[i].Time, kpTrans * transScale))
-        end
-        self.emitter.Transparency = NumberSequence.new(newKeypoints)
+    if curves.transparencyScaleOverDuration ~= nil then
+        local transScale = Utility.EvalNumberSequence(curves.transparencyScaleOverDuration, t)
+        self.emitter.Transparency = Utility.ScaleNumberSequence(self.baseTransparency, transScale)
+    else
+        self.emitter.Transparency = self.baseTransparency
     end
 
-    if self.tintOverDuration ~= nil then
-        local tint = Utility.EvalColorSequence(self.tintOverDuration, t)
-
-        local newKeypoints = {}
-        for i = 1, #self.baseColor.Keypoints do
-            local kpColor = self.baseColor.Keypoints[i].Value
-            table.insert(newKeypoints, ColorSequenceKeypoint.new(self.baseColor.Keypoints[i].Time, Color3.new(kpColor.R * tint.R, kpColor.G * tint.G, kpColor.B * tint.B)))
-        end
-        self.emitter.Color = ColorSequence.new(newKeypoints)
+    if curves.tintOverDuration ~= nil then
+        local tint = Utility.EvalColorSequence(curves.tintOverDuration, t)
+        self.emitter.Color = Utility.TintColorSequence(self.baseColor, tint)
+    else
+        self.emitter.Color = self.baseColor
     end
 end
 
 function ParticleDriver:Update(elapsedTime)
-    local delay = self.delay or 0
-    if elapsedTime < delay then
+    if self.timeline == nil or #self.timeline == 0 then
         self:HoldAtStart()
         return
     end
 
-    if not self.burstFired and self.burstCount ~= nil then
-        self.emitter:Emit(self.burstCount)
-        self.burstFired = true
-    end
-
-    local duration = self.duration
-    if duration == nil or duration <= 0 then
+    local curves, t, active, frozen, entry = Utility.ResolveTimeline(self.timeline, elapsedTime)
+    if not active or curves == nil then
+        self:HoldAtStart()
         return
     end
 
-    local localElapsed = elapsedTime - delay
-    local t = math.clamp(localElapsed / duration, 0, 1)
-    self:ApplyCurves(t)
+    -- fire the current stage's burst once, when the stage first begins; the
+    -- looping Hold stage does NOT re-fire on subsequent loop iterations
+    if not frozen and entry ~= nil and entry ~= self.lastBurstEntry then
+        if entry.burstCount ~= nil then
+            self.emitter:Emit(entry.burstCount)
+        end
+        self.lastBurstEntry = entry
+    end
+
+    self:ApplyCurves(curves, t, frozen)
 end
 
 return ParticleDriver

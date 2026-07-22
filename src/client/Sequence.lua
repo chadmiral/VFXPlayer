@@ -11,40 +11,83 @@ function Sequence:new(o)
     return o
 end
 
+--the three animation stages, in playback order
+local STAGES = { "Stand", "Hold", "Decay" }
+
+--read the timing (delay/duration/loop) attributes for a single stage on an instance
+local function readStageTiming(inst, stage, standDurationFallback)
+    local duration = inst:GetAttribute(stage.."Duration")
+    if duration == nil and stage == "Stand" then
+        -- the stand stage spans the whole sequence by default
+        duration = standDurationFallback
+    end
+
+    local loopCount = 1
+    if stage == "Hold" then
+        loopCount = inst:GetAttribute("HoldLoopCount") or 1
+    end
+
+    return {
+        delay = inst:GetAttribute(stage.."Delay") or 0,
+        duration = duration or 0,
+        loopCount = loopCount,
+    }
+end
+
+--read the curve attributes for a particle emitter stage (e.g. "StandSizeScaleOverDuration")
+local function readParticleStageCurves(e, stage)
+    return {
+        emissionScaleOverDuration = e:GetAttribute(stage.."EmissionScaleOverDuration"),
+        brightnessScaleOverDuration = e:GetAttribute(stage.."BrightnessScaleOverDuration"),
+        lightEmissionScaleOverDuration = e:GetAttribute(stage.."LightEmissionScaleOverDuration"),
+        lightInfluenceScaleOverDuration = e:GetAttribute(stage.."LightInfluenceScaleOverDuration"),
+        sizeScaleOverDuration = e:GetAttribute(stage.."SizeScaleOverDuration"),
+        transparencyScaleOverDuration = e:GetAttribute(stage.."TransparencyScaleOverDuration"),
+        tintOverDuration = e:GetAttribute(stage.."TintOverDuration"),
+    }
+end
+
+--read the curve attributes for a light stage
+local function readLightStageCurves(l, stage)
+    return {
+        brightnessScaleOverDuration = l:GetAttribute(stage.."BrightnessScaleOverDuration"),
+        rangeScaleOverDuration = l:GetAttribute(stage.."RangeScaleOverDuration"),
+        angleScaleOverDuration = l:GetAttribute(stage.."AngleScaleOverDuration"),
+        tintOverDuration = l:GetAttribute(stage.."TintOverDuration"),
+    }
+end
+
+--assemble the ordered stage definitions consumed by Utility.BuildTimeline
+local function buildStages(inst, standDurationFallback, readCurves)
+    local stages = {}
+    for _, stage in STAGES do
+        local timing = readStageTiming(inst, stage, standDurationFallback)
+        table.insert(stages, {
+            name = string.lower(stage),
+            delay = timing.delay,
+            duration = timing.duration,
+            loopCount = timing.loopCount,
+            burstCount = inst:GetAttribute(stage.."BurstCount"),
+            curves = readCurves(inst, stage),
+        })
+    end
+    return stages
+end
+
 local function initParticleEmitter(seq, e)
     local pd = ParticleDriver:new()
     pd.emitter = e
 
-    pd.duration = e:GetAttribute("Duration")
-    if pd.duration == nil then
-        pd.duration = seq.duration
-    end
-    pd.delay = e:GetAttribute("Delay")
-    if pd.delay == nil then
-        pd.delay = 0
-    end
-    pd.burstCount = e:GetAttribute("BurstCount")
-
     pd.baseRate = e.Rate
-    pd.emissionScaleOverDuration = e:GetAttribute("EmissionScaleOverDuration")
-
     pd.baseBrightness = e.Brightness
-    pd.brightnessScaleOverDuration = e:GetAttribute("BrightnessScaleOverDuration")
-
     pd.baseLightEmission = e.LightEmission
-    pd.lightEmissionScaleOverDuration = e:GetAttribute("LightEmissionScaleOverDuration")
-
     pd.baseLightInfluence = e.LightInfluence
-    pd.lightInfluenceScaleOverDuration = e:GetAttribute("LightInfluenceScaleOverDuration")
-
     pd.baseSize = e.Size
-    pd.sizeScaleOverDuration = e:GetAttribute("SizeScaleOverDuration")
-
     pd.baseColor = e.Color
-    pd.tintOverDuration = e:GetAttribute("TintOverDuration")
-
     pd.baseTransparency = e.Transparency
-    pd.transparencyScaleOverDuration = e:GetAttribute("TransparencyScaleOverDuration")
+
+    local stages = buildStages(e, seq.duration, readParticleStageCurves)
+    pd.timeline = Utility.BuildTimeline(stages)
 
     pd:BeginCycle()
 
@@ -56,28 +99,15 @@ local function initLight(seq, l)
     ld.light = l
     ld.isSpotLight = l:IsA("SpotLight")
 
-    ld.duration = l:GetAttribute("Duration")
-    if ld.duration == nil then
-        ld.duration = seq.duration
-    end
-    ld.delay = l:GetAttribute("Delay")
-    if ld.delay == nil then
-        ld.delay = 0
-    end
-
     ld.baseBrightness = l.Brightness
-    ld.brightnessScaleOverDuration = l:GetAttribute("BrightnessScaleOverDuration")
-
     ld.baseRange = l.Range
-    ld.rangeScaleOverDuration = l:GetAttribute("RangeScaleOverDuration")
-
     if ld.isSpotLight then
         ld.baseAngle = l.Angle
-        ld.angleScaleOverDuration = l:GetAttribute("AngleScaleOverDuration")
     end
-
     ld.baseColor = l.Color
-    ld.tintOverDuration = l:GetAttribute("TintOverDuration")
+
+    local stages = buildStages(l, seq.duration, readLightStageCurves)
+    ld.timeline = Utility.BuildTimeline(stages)
 
     ld:BeginCycle()
 

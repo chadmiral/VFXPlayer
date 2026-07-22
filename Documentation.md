@@ -2,9 +2,55 @@
 
 VFXPlayer drives `ParticleEmitter`, `PointLight`, and `SpotLight` instances inside a model tagged **`VFXSequence`**. Set attributes on those instances to control timing and animation curves.
 
-Curve attributes use normalized time **0 → 1** over each instance's effective duration (after its delay). At `t = 0` the curve's first keypoint is used; at `t = 1` the last keypoint is used.
+Each instance animates through up to three **stages** that play back-to-back: **`Stand`**, **`Hold`**, then **`Decay`**. Every stage has its own timing (delay + duration) and its own set of animation curves. Curve attributes are named `<Stage><Property>` — for example `StandSizeScaleOverDuration`, `HoldBrightnessScaleOverDuration`, or `DecayTransparencyScaleOverDuration`.
+
+Curve attributes use normalized time **0 → 1** over that stage's `Duration`. At `t = 0` the curve's first keypoint is used; at `t = 1` the last keypoint is used.
 
 Unless noted, scale curves **multiply** the instance's property value captured when the sequence starts. Tint curves **multiply** color channels (RGB) against the base color.
+
+---
+
+## Stages
+
+The three stages always play in the order **`Stand` → `Hold` → `Decay`**, one after another along a single timeline that starts when the sequence begins.
+
+| Stage | Repeats | Purpose (by convention) |
+|-------|---------|-------------------------|
+| `Stand` | Once | Ramp-up / establishing state of the effect. |
+| `Hold` | `HoldLoopCount` times | Sustained, optionally looping, body of the effect. |
+| `Decay` | Once | Fade-out / dissipation of the effect. |
+
+### Timing model
+
+Each stage is placed on the timeline sequentially:
+
+1. A stage's `<Stage>Delay` inserts a gap **before** that stage begins, measured from the end of the previous stage (or from the sequence start, for the first active stage).
+2. The stage then runs for `<Stage>Duration` seconds. `Hold` runs its duration `HoldLoopCount` times (its curves restart from `t = 0` on each iteration).
+3. The next stage begins immediately after (plus its own delay).
+
+A stage with a `Duration` of `0` (or unset, except `Stand` — see below) is **skipped entirely**, and its delay is ignored.
+
+### Holding behavior between and around stages
+
+- **Before the first stage** (during its delay): the instance is held at its starting/off state — emission is suppressed (`Rate = 0` for emitters, `Brightness = 0` for lights) and other properties are held at their base values.
+- **In a gap between two stages** (caused by a delay): the previous stage is frozen at its final value (`t = 1`).
+- **After the final stage ends**: the last stage is frozen at its final value (`t = 1`) until the sequence ends or loops.
+
+For `ParticleEmitter` instances, whenever a stage has elapsed (both of the frozen cases above), the emitter's `Rate` is additionally forced to `0`. This stops new particles from spawning while every other property stays frozen, so particles that already exist finish out their normal lifetime instead of being killed. Lights remain fully frozen (including `Brightness`) in these states.
+
+### Stage timing attributes
+
+Set these on each `ParticleEmitter` / light. Every attribute is optional.
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `StandDelay` | `number` | `0` | Gap before the stand stage begins. |
+| `StandDuration` | `number` | parent sequence `Duration` | Length of the stand stage. Defaults to the whole sequence, so a single-stage effect only needs to set stand curves. Set to `0` to disable the stand stage. |
+| `HoldDelay` | `number` | `0` | Gap after stand ends, before hold begins. |
+| `HoldDuration` | `number` | `0` (skipped) | Length of **one** hold iteration. |
+| `HoldLoopCount` | `number` | `1` | Number of times the hold stage repeats. |
+| `DecayDelay` | `number` | `0` | Gap after hold ends, before decay begins. |
+| `DecayDuration` | `number` | `0` (skipped) | Length of the decay stage. |
 
 ---
 
@@ -14,57 +60,61 @@ Tag the root model with **`VFXSequence`** (via CollectionService) and set these 
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `Duration` | `number` | Total sequence length in seconds. Required for playback; when elapsed time exceeds this value, the sequence stops or loops. Also used as the default `Duration` for child emitters and lights that do not define their own. |
+| `Duration` | `number` | Total sequence length in seconds. Required for playback; when elapsed time exceeds this value, the sequence stops or loops. Also used as the default `StandDuration` for child emitters and lights that do not define their own. |
 | `Looping` | `boolean` | If `true`, the sequence restarts from the beginning when `Duration` elapses. If unset or `false`, the sequence is removed after one play-through. |
 | `PlayOnStart` | `boolean` | If `true`, the sequence begins playing automatically when the client initializes. Sequences without this attribute (or with it set to `false`) must be started by other game logic. |
 
 ### Notes
 
-- The root model's `Duration` governs when the sequence ends or loops; individual emitters and lights can override this with their own `Duration` attribute for per-instance animation windows.
+- The root model's `Duration` governs when the whole sequence ends or loops, independent of the per-instance stage timeline. If the stages of an instance total more than the sequence `Duration`, later stages may be cut off; if they total less, the final stage is frozen until the sequence ends.
 - On loop, all particle and light drivers are re-initialized and per-cycle state (such as burst emission) is reset.
 
 ---
 
 ## ParticleEmitter
 
-Apply these attributes to any `ParticleEmitter` descendant of a `VFXSequence` model.
+Apply these attributes to any `ParticleEmitter` descendant of a `VFXSequence` model. Curve attributes exist per stage — prefix each with `Stand`, `Hold`, or `Decay`.
 
-| Attribute | Type | Affects | Description |
-|-----------|------|---------|-------------|
-| `Duration` | `number` | Timing | Length of the animation window in seconds. Falls back to the parent sequence's `Duration` if unset. |
-| `Delay` | `number` | Timing | Seconds to wait before animation begins. Default: `0`. During delay, emission is suppressed (`Rate = 0`) and properties are held at their starting values. |
-| `BurstCount` | `number` | Emission | If set, emits this many particles once when the delay ends (once per sequence cycle). |
-| `EmissionScaleOverDuration` | `NumberSequence` | `Rate` | Scales the emitter's base `Rate` over the duration. |
-| `BrightnessScaleOverDuration` | `NumberSequence` | `Brightness` | Scales the emitter's base `Brightness` over the duration. |
-| `LightEmissionScaleOverDuration` | `NumberSequence` | `LightEmission` | Scales the emitter's base `LightEmission` over the duration. |
-| `LightInfluenceScaleOverDuration` | `NumberSequence` | `LightInfluence` | Scales the emitter's base `LightInfluence` over the duration. |
-| `SizeScaleOverDuration` | `NumberSequence` | `Size` | Scales every keypoint in the emitter's base `Size` `NumberSequence` over the duration. |
-| `TransparencyScaleOverDuration` | `NumberSequence` | `Transparency` | Scales every keypoint in the emitter's base `Transparency` `NumberSequence` over the duration. |
-| `TintOverDuration` | `ColorSequence` | `Color` | Multiplies each keypoint in the emitter's base `Color` `ColorSequence` by the evaluated tint color over the duration. |
+| Curve (per stage) | Type | Affects | Description |
+|-------------------|------|---------|-------------|
+| `<Stage>EmissionScaleOverDuration` | `NumberSequence` | `Rate` | Scales the emitter's base `Rate` over the stage. |
+| `<Stage>BrightnessScaleOverDuration` | `NumberSequence` | `Brightness` | Scales the emitter's base `Brightness` over the stage. |
+| `<Stage>LightEmissionScaleOverDuration` | `NumberSequence` | `LightEmission` | Scales the emitter's base `LightEmission` over the stage. |
+| `<Stage>LightInfluenceScaleOverDuration` | `NumberSequence` | `LightInfluence` | Scales the emitter's base `LightInfluence` over the stage. |
+| `<Stage>SizeScaleOverDuration` | `NumberSequence` | `Size` | Scales every keypoint in the emitter's base `Size` `NumberSequence` over the stage. |
+| `<Stage>TransparencyScaleOverDuration` | `NumberSequence` | `Transparency` | Scales every keypoint in the emitter's base `Transparency` `NumberSequence` over the stage. |
+| `<Stage>TintOverDuration` | `ColorSequence` | `Color` | Multiplies each keypoint in the emitter's base `Color` `ColorSequence` by the evaluated tint color over the stage. |
+
+Non-curve attributes (also per stage):
+
+| Attribute (per stage) | Type | Affects | Description |
+|-----------------------|------|---------|-------------|
+| `<Stage>BurstCount` | `number` | Emission | If set, emits this many particles once when that stage begins. Fires only once per stage — the looping `Hold` stage does **not** re-fire its burst on subsequent loop iterations. |
+
+Example attributes for a two-stage emitter: `StandEmissionScaleOverDuration`, `StandSizeScaleOverDuration`, `StandBurstCount`, `DecayTransparencyScaleOverDuration`, plus timing `StandDuration = 0.5`, `DecayDuration = 1.0`.
 
 ### Notes
 
 - Base values (`Rate`, `Brightness`, `LightEmission`, `LightInfluence`, `Size`, `Color`, `Transparency`) are read from the instance when the sequence starts or loops.
-- If `Duration` is unset or `<= 0`, curve attributes have no effect after the delay (aside from a one-shot `BurstCount` emit).
-- Omitting a curve attribute leaves that property at its base value for the full animation window.
+- Once a stage has elapsed (in a gap before the next stage, or after the final stage), `Rate` is forced to `0` while all other properties stay frozen at the ended stage's final values — already-spawned particles continue their lifetime, but no new particles are emitted.
+- Within an active stage, any property whose curve is **not** set for that stage is driven back to its base value. This means a property animated in `Stand` returns to its base during `Hold`/`Decay` unless those stages also define a curve for it.
+- Omitting all curve attributes for a stage leaves every property at its base value for that stage's window.
 
 ---
 
 ## Lights (`PointLight`, `SpotLight`)
 
-Apply these attributes to any `PointLight` or `SpotLight` descendant of a `VFXSequence` model.
+Apply these attributes to any `PointLight` or `SpotLight` descendant of a `VFXSequence` model. Curve attributes exist per stage — prefix each with `Stand`, `Hold`, or `Decay`.
 
-| Attribute | Type | Affects | Description |
-|-----------|------|---------|-------------|
-| `Duration` | `number` | Timing | Length of the animation window in seconds. Falls back to the parent sequence's `Duration` if unset. |
-| `Delay` | `number` | Timing | Seconds to wait before animation begins. Default: `0`. During delay, the light is off (`Brightness = 0`) and other properties are held at their starting values. |
-| `BrightnessScaleOverDuration` | `NumberSequence` | `Brightness` | Scales the light's base `Brightness` over the duration. |
-| `RangeScaleOverDuration` | `NumberSequence` | `Range` | Scales the light's base `Range` over the duration. |
-| `AngleScaleOverDuration` | `NumberSequence` | `Angle` | **SpotLight only.** Scales the light's base `Angle` over the duration. Ignored on `PointLight`. |
-| `TintOverDuration` | `ColorSequence` | `Color` | Multiplies the light's base `Color` by the evaluated tint color over the duration. |
+| Curve (per stage) | Type | Affects | Description |
+|-------------------|------|---------|-------------|
+| `<Stage>BrightnessScaleOverDuration` | `NumberSequence` | `Brightness` | Scales the light's base `Brightness` over the stage. |
+| `<Stage>RangeScaleOverDuration` | `NumberSequence` | `Range` | Scales the light's base `Range` over the stage. |
+| `<Stage>AngleScaleOverDuration` | `NumberSequence` | `Angle` | **SpotLight only.** Scales the light's base `Angle` over the stage. Ignored on `PointLight`. |
+| `<Stage>TintOverDuration` | `ColorSequence` | `Color` | Multiplies the light's base `Color` by the evaluated tint color over the stage. |
 
 ### Notes
 
 - Base values (`Brightness`, `Range`, `Angle`, `Color`) are read from the instance when the sequence starts or loops.
-- If `Duration` is unset or `<= 0`, curve attributes have no effect after the delay.
-- Omitting a curve attribute leaves that property at its base value for the full animation window.
+- Within an active stage, any property whose curve is **not** set for that stage is driven back to its base value.
+- Omitting all curve attributes for a stage leaves every property at its base value for that stage's window.
