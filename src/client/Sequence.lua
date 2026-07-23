@@ -74,17 +74,27 @@ local function buildStages(inst, standDurationFallback, readCurves)
     return stages
 end
 
+--resolve a base animation value: prefer a `Base<Property>` attribute override on
+--the instance, otherwise fall back to the instance's native property value
+local function baseValue(inst, property, nativeValue)
+    local override = inst:GetAttribute("Base"..property)
+    if override ~= nil then
+        return override
+    end
+    return nativeValue
+end
+
 local function initParticleEmitter(seq, e)
     local pd = ParticleDriver:new()
     pd.emitter = e
 
-    pd.baseRate = e.Rate
-    pd.baseBrightness = e.Brightness
-    pd.baseLightEmission = e.LightEmission
-    pd.baseLightInfluence = e.LightInfluence
-    pd.baseSize = e.Size
-    pd.baseColor = e.Color
-    pd.baseTransparency = e.Transparency
+    pd.baseRate = baseValue(e, "Rate", e.Rate)
+    pd.baseBrightness = baseValue(e, "Brightness", e.Brightness)
+    pd.baseLightEmission = baseValue(e, "LightEmission", e.LightEmission)
+    pd.baseLightInfluence = baseValue(e, "LightInfluence", e.LightInfluence)
+    pd.baseSize = baseValue(e, "Size", e.Size)
+    pd.baseColor = baseValue(e, "Color", e.Color)
+    pd.baseTransparency = baseValue(e, "Transparency", e.Transparency)
     pd.baseEnabled = e.Enabled
 
     local fadeDistance = e:GetAttribute("FadeDistance")

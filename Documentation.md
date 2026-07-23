@@ -97,11 +97,27 @@ Distance fade attribute (whole emitter, not per stage):
 |-----------|------|---------|-------------|
 | `FadeDistance` | `NumberRange` | `Transparency` / `Enabled` | Camera-distance fade range in studs. `Min` is where the emitter begins to fade out (fully visible nearer than this); `Max` is where the fade is complete (fully transparent). At or beyond `Max` the emitter is disabled to stop emitting; it is automatically re-enabled once the camera moves back within `Max`. |
 
+Base value overrides (whole emitter, not per stage):
+
+Scale and tint curves multiply against a **base value** for each property. By default the base value is the emitter's native property, but you can override it with a `Base<Property>` attribute of the matching type. When present, the attribute is used as the base that the curves scale/tint against; when absent, the native property is used.
+
+| Attribute | Type | Overrides base of |
+|-----------|------|-------------------|
+| `BaseRate` | `number` | `Rate` |
+| `BaseBrightness` | `number` | `Brightness` |
+| `BaseLightEmission` | `number` | `LightEmission` |
+| `BaseLightInfluence` | `number` | `LightInfluence` |
+| `BaseSize` | `NumberSequence` | `Size` |
+| `BaseTransparency` | `NumberSequence` | `Transparency` |
+| `BaseColor` | `ColorSequence` | `Color` |
+
+For example, `BaseRate` is the emission rate that `StandEmissionScaleOverDuration` (and the other stages' emission curves) multiply against, regardless of the emitter's authored `Rate`.
+
 Example attributes for a two-stage emitter: `StandEmissionScaleOverDuration`, `StandSizeScaleOverDuration`, `StandBurstCount`, `DecayTransparencyScaleOverDuration`, plus timing `StandDuration = 0.5`, `DecayDuration = 1.0`.
 
 ### Notes
 
-- Base values (`Rate`, `Brightness`, `LightEmission`, `LightInfluence`, `Size`, `Color`, `Transparency`, `Enabled`) are read from the instance when the sequence starts or loops.
+- Base values (`Rate`, `Brightness`, `LightEmission`, `LightInfluence`, `Size`, `Color`, `Transparency`, `Enabled`) are read from the instance when the sequence starts or loops. For every property except `Enabled`, a `Base<Property>` attribute (see above) takes precedence over the native value when present.
 - Once a stage has elapsed (in a gap before the next stage, or after the final stage), `Rate` is forced to `0` while all other properties stay frozen at the ended stage's final values — already-spawned particles continue their lifetime, but no new particles are emitted.
 - **Distance fade:** `FadeDistance` must be set for the fade to activate. Each frame, the camera-to-emitter distance (measured to the emitter's parent `BasePart` or `Attachment`) produces a fade factor that is layered on top of the stage `Transparency` — at `FadeDistance.Min` the emitter is fully visible, at `FadeDistance.Max` it is fully transparent, interpolating linearly in between. This fade multiplies opacity, so it composes with any `<Stage>TransparencyScaleOverDuration` animation. Beyond `FadeDistance.Max` the emitter's `Enabled` is set to `false` (stopping new emission while existing particles finish their lifetime); it is restored to its authored `Enabled` value once the camera is within `FadeDistance.Max`. If the attribute is unset, no distance fade or culling is applied.
 - Within an active stage, any property whose curve is **not** set for that stage is driven back to its base value. This means a property animated in `Stand` returns to its base during `Hold`/`Decay` unless those stages also define a curve for it.
