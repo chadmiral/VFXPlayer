@@ -1,9 +1,9 @@
-print("VFXPlayer")
-
-local Sequence = require(script.Parent:WaitForChild("Sequence"))
+print("VFXPlayer v0.0.1")
 
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
+
+local Sequence = require(script.Parent:WaitForChild("Sequence"))
 
 local activeSequences = {}
 

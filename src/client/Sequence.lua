@@ -4,6 +4,7 @@ local Utility = require(script.Parent:WaitForChild("Utility"))
 local ParticleDriver = require(script.Parent:WaitForChild("ParticleDriver"))
 local LightDriver = require(script.Parent:WaitForChild("LightDriver"))
 
+
 function Sequence:new(o)
     o = o or {}
     setmetatable(o, self)
@@ -96,6 +97,12 @@ local function initParticleEmitter(seq, e)
     pd.baseColor = baseValue(e, "Color", e.Color)
     pd.baseTransparency = baseValue(e, "Transparency", e.Transparency)
     pd.baseEnabled = e.Enabled
+
+    -- scalar multiplier applied to the base size sequence before stage size curves
+    local baseSizeMultiplier = e:GetAttribute("BaseSizeMultiplier")
+    if baseSizeMultiplier ~= nil then
+        pd.baseSize = Utility.ScaleNumberSequence(pd.baseSize, baseSizeMultiplier)
+    end
 
     local fadeDistance = e:GetAttribute("FadeDistance")
     if fadeDistance ~= nil then

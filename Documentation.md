@@ -113,6 +113,12 @@ Scale and tint curves multiply against a **base value** for each property. By de
 
 For example, `BaseRate` is the emission rate that `StandEmissionScaleOverDuration` (and the other stages' emission curves) multiply against, regardless of the emitter's authored `Rate`.
 
+Additionally:
+
+| Attribute | Type | Affects | Description |
+|-----------|------|---------|-------------|
+| `BaseSizeMultiplier` | `number` | `Size` | Scalar applied to the resolved base size (`BaseSize` if set, otherwise the native `Size`) when the sequence starts. Every keypoint of the base size `NumberSequence` is multiplied by this value, so it composes multiplicatively with the per-stage `<Stage>SizeScaleOverDuration` curves. Defaults to `1` (no change) when unset. |
+
 Example attributes for a two-stage emitter: `StandEmissionScaleOverDuration`, `StandSizeScaleOverDuration`, `StandBurstCount`, `DecayTransparencyScaleOverDuration`, plus timing `StandDuration = 0.5`, `DecayDuration = 1.0`.
 
 ### Notes

@@ -5,7 +5,22 @@
 
     "ReplicatedStorage": {
       "Shared": {
-        "$path": "src/shared"
+        "$className": "Folder",
+        "VFXPlayer": {
+          "$path": "src/shared/VFXPlayer",
+          "LightDriver": {
+            "$path": "src/client/LightDriver.lua"
+          },
+          "ParticleDriver": {
+            "$path": "src/client/ParticleDriver.lua"
+          },
+          "Sequence": {
+            "$path": "src/client/Sequence.lua"
+          },
+          "Utility": {
+            "$path": "src/client/Utility.lua"
+          }
+        }
       }
     },
 
