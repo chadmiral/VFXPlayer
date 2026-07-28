@@ -22,6 +22,9 @@
           },
           "Utility": {
             "$path": "src/client/Utility.lua"
+          },
+          "VFX": {
+            "$path": "src/client/VFX.lua"
           }
         }
       }
