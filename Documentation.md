@@ -1,6 +1,6 @@
 # Animatable Attributes
 
-VFXPlayer drives `ParticleEmitter`, `PointLight`, and `SpotLight` instances inside a model tagged **`VFXSequence`**. Set attributes on those instances to control timing and animation curves.
+VFXPlayer drives `ParticleEmitter`, `PointLight`, and `SpotLight` instances inside a model tagged **`VFXSequence`**. Set attributes on those instances to control timing and animation curves. It also emits real `MeshPart` particles from `Attachment`s tagged **`MeshEmitter`** (see [MeshEmitter](#meshemitter-tagged-attachment)), which use their own emission model rather than the stage system below.
 
 Each instance animates through up to three **stages** that play back-to-back: **`Stand`**, **`Hold`**, then **`Decay`**. Every stage has its own timing (delay + duration) and its own set of animation curves. Curve attributes are named `<Stage><Property>` — for example `StandSizeScaleOverDuration`, `HoldBrightnessScaleOverDuration`, or `DecayTransparencyScaleOverDuration`.
 
@@ -119,6 +119,8 @@ Additionally:
 |-----------|------|---------|-------------|
 | `BaseSizeMultiplier` | `number` | `Size` | Scalar applied to the resolved base size (`BaseSize` if set, otherwise the native `Size`) when the sequence starts. Every keypoint of the base size `NumberSequence` is multiplied by this value, so it composes multiplicatively with the per-stage `<Stage>SizeScaleOverDuration` curves. Defaults to `1` (no change) when unset. |
 
+When the **Play VFX** plugin button auto-authors these attributes, it splits the emitter's native `Size` into a `BaseSize` curve normalized to `[0,1]` (divided by its peak keypoint value) and a `BaseSizeMultiplier` holding that peak, so `BaseSize × BaseSizeMultiplier` reproduces the original `Size`. This keeps the size *shape* and its overall *scale* independently adjustable.
+
 Example attributes for a two-stage emitter: `StandEmissionScaleOverDuration`, `StandSizeScaleOverDuration`, `StandBurstCount`, `DecayTransparencyScaleOverDuration`, plus timing `StandDuration = 0.5`, `DecayDuration = 1.0`.
 
 ### Notes
@@ -147,3 +149,35 @@ Apply these attributes to any `PointLight` or `SpotLight` descendant of a `VFXSe
 - Base values (`Brightness`, `Range`, `Angle`, `Color`) are read from the instance when the sequence starts or loops.
 - Within an active stage, any property whose curve is **not** set for that stage is driven back to its base value.
 - Omitting all curve attributes for a stage leaves every property at its base value for that stage's window.
+
+---
+
+## MeshEmitter (tagged `Attachment`)
+
+Mesh particles are emitted from an **`Attachment`** (a descendant of a `VFXSequence` model) that is tagged **`MeshEmitter`** via CollectionService. Unlike `ParticleEmitter`/light drivers, a MeshEmitter does **not** use the stage system — it emits real `MeshPart`/`BasePart` clones at a fixed rate, and each particle animates over its own lifetime.
+
+The attachment must have an **`ObjectValue`** child whose `Value` points to the mesh template to clone for every particle. (Keep the template out of the way — e.g. in `ReplicatedStorage` — so it isn't itself rendered.) If no valid template is found, the emitter warns and spawns nothing.
+
+Particles emit while the sequence is playing (i.e. up to the sequence `Duration`). Particles spawned near the end continue to animate for their full lifetime and are then destroyed, independently of when the sequence ends or loops.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `EmissionRate` | `number` | Particles spawned per second while the sequence is playing. Defaults to `0` (no emission). |
+| `BurstCount` | `number` | One-shot burst: this many particles are spawned at once when the cycle begins (and again on each loop), independent of `EmissionRate`. Omit for no burst. |
+| `ParticleLifetime` | `NumberRange` | Per-particle lifetime in seconds, sampled uniformly between `Min` and `Max`. This is also the duration over which the `*OverParticleLifetime` curves are evaluated (`t = 0` at spawn, `t = 1` at death). Defaults to `1` second. |
+| `ColorOverParticleLifetime` | `ColorSequence` | The particle's `Color`, evaluated over its lifetime. Omit to leave the template's color unchanged. |
+| `SizeOverParticleLifetime` | `NumberSequence` | Uniform scale multiplier applied to the template's `Size`, evaluated over the lifetime. Omit to leave the template's size unchanged. |
+| `SizeMultiplier` | `number` | Scalar multiplied into the `SizeOverParticleLifetime` result, so the effective size is `template.Size × SizeMultiplier × SizeOverParticleLifetime(t)`. Has no effect if `SizeOverParticleLifetime` is unset. Defaults to `1`. |
+| `TransparencyOverParticleLifetime` | `NumberSequence` | The particle's `Transparency`, evaluated over its lifetime. Omit to leave the template's transparency unchanged. |
+| `RotationMin` | `Vector3` | Minimum initial rotation as Euler angles in **degrees**. Defaults to `(0,0,0)`. |
+| `RotationMax` | `Vector3` | Maximum initial rotation as Euler angles in **degrees**. Each particle's initial rotation is sampled uniformly per-axis between `RotationMin` and `RotationMax`. Defaults to `(0,0,0)`. |
+| `Anchored` | `boolean` | If `true`, particles are anchored and ignore physics; if `false` (default), particles are unanchored and fall under gravity. |
+| `Collide` | `boolean` | If `true`, particles physically collide with other geometry; if `false` (default), they pass through everything. |
+
+### Notes
+
+- Particles spawn at the attachment's current `WorldPosition` (sampled at spawn time, so a moving emitter emits along its path) with the randomly sampled rotation applied.
+- All particles are spawned with `CanTouch` and `CanQuery` disabled for efficiency, and `CanCollide` is `false` unless `Collide` is set to `true`.
+- Particles are parented to a `VFXMeshParticles` folder in `Workspace`, animated by a single shared per-frame loop, and `Destroy()`ed when their lifetime elapses — so there is no per-particle connection and no memory leak. The shared loop stops itself when no particles remain.
+- Because particle simulation is independent of the sequence, particles are not cleared when a sequence ends or loops; they simply live out their remaining lifetime.
+- A single-frame time step is clamped (to 0.1s) so a lag spike or tab-out cannot spawn a flood of particles at once.

@@ -1,8 +1,13 @@
-Sequence = { name = "Sequence", _type = "Sequence", model = nil, startTime = -1, duration = -1, looping = false, particleDrivers = {}, lightDrivers = {} }
+Sequence = { name = "Sequence", _type = "Sequence", model = nil, startTime = -1, duration = -1, looping = false, particleDrivers = {}, lightDrivers = {}, meshDrivers = {} }
 
 local Utility = require(script.Parent:WaitForChild("Utility"))
 local ParticleDriver = require(script.Parent:WaitForChild("ParticleDriver"))
 local LightDriver = require(script.Parent:WaitForChild("LightDriver"))
+local MeshParticleDriver = require(script.Parent:WaitForChild("MeshParticleDriver"))
+
+local CollectionService = game:GetService("CollectionService")
+
+local MESH_EMITTER_TAG = "MeshEmitter"
 
 
 function Sequence:new(o)
@@ -138,6 +143,52 @@ local function initLight(seq, l)
     return ld
 end
 
+local function initMeshEmitter(seq, a)
+    local md = MeshParticleDriver:new()
+    md.emitter = a
+
+    -- the mesh template is referenced by an ObjectValue child of the attachment
+    local objectValue = a:FindFirstChildOfClass("ObjectValue")
+    if objectValue ~= nil then
+        md.template = objectValue.Value
+    end
+    if md.template ~= nil then
+        md.baseSize = md.template.Size
+
+        -- scalar folded into the base size; because base size is only applied
+        -- alongside SizeOverParticleLifetime, this multiplies against that curve
+        local sizeMultiplier = a:GetAttribute("SizeMultiplier")
+        if sizeMultiplier ~= nil then
+            md.baseSize = md.baseSize * sizeMultiplier
+        end
+    else
+        warn("MeshEmitter '"..a:GetFullName().."' has no ObjectValue pointing to a mesh template; no particles will spawn")
+    end
+
+    local lifetime = a:GetAttribute("ParticleLifetime")
+    if lifetime ~= nil then
+        md.lifetimeMin = lifetime.Min
+        md.lifetimeMax = lifetime.Max
+    end
+
+    md.colorOverLifetime = a:GetAttribute("ColorOverParticleLifetime")
+    md.sizeOverLifetime = a:GetAttribute("SizeOverParticleLifetime")
+    md.transparencyOverLifetime = a:GetAttribute("TransparencyOverParticleLifetime")
+
+    md.rotationMin = a:GetAttribute("RotationMin")
+    md.rotationMax = a:GetAttribute("RotationMax")
+
+    md.anchored = a:GetAttribute("Anchored") == true
+    md.collide = a:GetAttribute("Collide") == true
+
+    md.emissionRate = a:GetAttribute("EmissionRate") or 0
+    md.burstCount = a:GetAttribute("BurstCount")
+
+    md:BeginCycle()
+
+    return md
+end
+
 --reset all playing emitters to their starting states
 local function resetParticleDrivers(seq)
     for _,pd in seq.particleDrivers do
@@ -169,6 +220,9 @@ function Sequence:Init()
     resetLightDrivers(self)
     self.particleDrivers = {}
     self.lightDrivers = {}
+    -- previously spawned mesh particles keep animating via the shared
+    -- simulation loop; dropping the old drivers just stops further emission
+    self.meshDrivers = {}
 
     local descendants = self.model:GetDescendants()
     for _,d in descendants do
@@ -178,6 +232,9 @@ function Sequence:Init()
         elseif d:IsA("PointLight") or d:IsA("SpotLight") then
             local ld = initLight(self, d)
             table.insert(self.lightDrivers, ld)
+        elseif d:IsA("Attachment") and CollectionService:HasTag(d, MESH_EMITTER_TAG) then
+            local md = initMeshEmitter(self, d)
+            table.insert(self.meshDrivers, md)
         end
     end
 end
@@ -189,6 +246,10 @@ function Sequence:Update(elapsedTime)
 
     for _,ld in self.lightDrivers do
         ld:Update(elapsedTime)
+    end
+
+    for _,md in self.meshDrivers do
+        md:Update(elapsedTime)
     end
 end
 

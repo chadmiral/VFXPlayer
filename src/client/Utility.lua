@@ -46,12 +46,13 @@ function Utility.EvalColorSequence(sequence: ColorSequence, time: number)
     end
 end
 
--- Scale every keypoint value of a NumberSequence by a scalar.
+-- Scale every keypoint of a NumberSequence by a scalar. Envelopes are a +/-
+-- range in the same units as the value, so they scale by the same factor.
 function Utility.ScaleNumberSequence(sequence: NumberSequence, scale: number)
     local newKeypoints = {}
     for i = 1, #sequence.Keypoints do
         local kp = sequence.Keypoints[i]
-        table.insert(newKeypoints, NumberSequenceKeypoint.new(kp.Time, kp.Value * scale))
+        table.insert(newKeypoints, NumberSequenceKeypoint.new(kp.Time, kp.Value * scale, kp.Envelope * scale))
     end
     return NumberSequence.new(newKeypoints)
 end
