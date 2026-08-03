@@ -1,4 +1,4 @@
-VFX = {}
+VFXClient = {}
 
 local Sequence = require(script.Parent:WaitForChild("Sequence"))
 
@@ -67,7 +67,7 @@ end
 
 --play a VFXSequence model that is already placed in the world. The model is
 --left in place when playback completes.
-function VFX.PlaySequence(model)
+function VFXClient.PlaySequence(model)
     return startSequence(model, false)
 end
 
@@ -75,7 +75,7 @@ end
 --instance. A one-shot template's copy is destroyed once playback completes; a
 --template with Looping set plays continuously, so destroy the returned instance
 --when you want it to stop.
-function VFX.PlayVFX(template: Model, cframe: CFrame)
+function VFXClient.PlayVFX(template: Model, cframe: CFrame)
     local instance = template:Clone()
     -- position before parenting so the copy never renders at the template's spot
     instance:PivotTo(cframe)
@@ -87,4 +87,4 @@ function VFX.PlayVFX(template: Model, cframe: CFrame)
     return instance
 end
 
-return VFX
+return VFXClient

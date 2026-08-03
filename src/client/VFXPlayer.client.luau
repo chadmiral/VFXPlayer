@@ -14,5 +14,5 @@ local function Init()
     end
 end
 
-wait(1)
+task.wait(1) --prevents bug when waiting for content 
 Init()
