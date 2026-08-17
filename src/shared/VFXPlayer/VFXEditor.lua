@@ -145,6 +145,9 @@ local function readStageTimings(inst: Instance, sequenceDuration: number)
 end
 --how much of a parameter row the name takes, leaving the rest to the editor
 local NAME_COLUMN = 0.45
+--the small square buttons that live inside a row: the "+" on a stage's heading and
+--the "-" on each of its parameters
+local ROW_BUTTON_SIZE = ROW_HEIGHT - 6
 
 --Roblox exposes no property reflection to plugins, so the native properties
 --worth showing for each driven class are enumerated here, in display order.
@@ -273,6 +276,164 @@ end
 --property such an attribute stands in for, or nil if the name is not one.
 local function baseAttributeTarget(attributeName: string): string?
 	return string.match(attributeName, "^Base(.+)$")
+end
+
+--The sections the parameter pane is divided into, in the order it shows them: what
+--the timeline is made of, then the emitter's own parameters split by whether they
+--vary across a particle's life, then one section per stage for what that stage
+--animates. The last three are built from STAGES so that they cannot fall out of
+--step with it, and so that a section's index says which stage it is for.
+local SECTION_TIMELINE = 1
+local SECTION_PARTICLE_AGE = 2
+local SECTION_BASE = 3
+local SECTION_STAGE_FIRST = SECTION_BASE + 1
+
+local SECTION_TITLES = {
+	"Timeline",
+	"Animated Over Particle Age",
+	"Base Parameters",
+}
+
+--A wash of colour behind each section, so that what kind of parameter a row is can
+--be read without looking back up to the heading it sits under. These are hues to
+--blend into the theme's own background rather than colours in their own right, so
+--that the pane stays as readable in a light theme as in a dark one.
+--The first three keep well clear of the blue, green and orange the stages have
+--taken; a teal for the second read too close to Stand's blue to be worth having.
+local SECTION_HUES = {
+	Color3.fromRGB(146, 108, 204),
+	Color3.fromRGB(190, 96, 150),
+	Color3.fromRGB(148, 148, 158),
+}
+
+--Each stage's section is named and coloured exactly as its block in the timeline
+--is, which is the whole reason for splitting them apart: the band above says when
+--Hold plays, and the green section below says what it does while it is playing.
+for _, stage in STAGES do
+	table.insert(SECTION_TITLES, stage)
+	table.insert(SECTION_HUES, STAGE_COLORS[string.lower(stage)])
+end
+
+local SECTION_COUNT = #SECTION_TITLES
+
+--How far towards its hue a section's rows are taken, and its heading, which goes
+--much further: the heading band is where the colour is meant to be read, and it
+--carries the theme's full-strength text so it can afford one. The rows only have
+--to look washed, and a wash costs contrast whichever way it goes, since it
+--lightens a dark theme's background and darkens a light one's. At this weight the
+--wash is still some ten values away from the plain background -- plainly visible
+--across a row's width -- while costing a tenth of the contrast the row's name had.
+local SECTION_TINT = 0.07
+local SECTION_HEADING_TINT = 0.32
+
+--Of a stage's attributes, the ones that decide where the stage sits on the
+--timeline rather than what it does while it is there. `LoopCount` belongs to Hold
+--alone, but naming it per stage is not worth the exception.
+local TIMELINE_STAGE_PARTS = {
+	Delay = true,
+	Duration = true,
+	LoopCount = true,
+}
+
+--The sequence root's own timings, which are not named after any stage: how long
+--the whole effect runs for and whether it starts again afterwards.
+local TIMELINE_ATTRIBUTES = {
+	Duration = true,
+	Looping = true,
+}
+
+--What can be authored per stage, listed by the kind of emitter whose driver reads
+--it: each entry is the part of the attribute name that follows the stage. These
+--are the names the drivers actually look up, so a light is not offered the size
+--curve it would ignore, and a mesh emitter -- whose driver reads a burst and no
+--curves at all -- is offered only the burst. Kept in alphabetical order, which is
+--the order the rows they become are sorted into, so that what a stage's menu
+--offers and what its section shows read the same way down the list.
+local STAGE_ATTRIBUTE_PARTS = {
+	ParticleEmitter = {
+		"BrightnessScaleOverDuration",
+		"BurstCount",
+		"EmissionScaleOverDuration",
+		"LightEmissionScaleOverDuration",
+		"LightInfluenceScaleOverDuration",
+		"SizeScaleOverDuration",
+		"TintOverDuration",
+		"TransparencyScaleOverDuration",
+	},
+	PointLight = {
+		"BrightnessScaleOverDuration",
+		"RangeScaleOverDuration",
+		"TintOverDuration",
+	},
+	SpotLight = {
+		"AngleScaleOverDuration",
+		"BrightnessScaleOverDuration",
+		"RangeScaleOverDuration",
+		"TintOverDuration",
+	},
+	[MESH_EMITTER_TAG] = {
+		"BurstCount",
+	},
+}
+
+--What a newly added stage attribute starts at: whatever leaves playback exactly as
+--it was, so that adding one gives something to edit rather than an immediate change
+--to the effect. A scale curve of 1 multiplies a base value by itself, a white tint
+--multiplies a colour by itself, and a burst of none emits nothing.
+local function defaultStageValue(part: string): any
+	if part == "BurstCount" then
+		return 0
+	end
+	if string.find(part, "Tint", 1, true) ~= nil then
+		return ColorSequence.new(Color3.new(1, 1, 1))
+	end
+	return NumberSequence.new(1)
+end
+
+--Which stage an attribute belongs to and what it says about that stage:
+--"HoldDelay" is the Hold stage's "Delay". Returns nil for a name that names no
+--stage, which is every parameter that is not authored per stage.
+local function stageAttribute(attributeName: string): (number?, string?)
+	for index, stage in STAGES do
+		if string.sub(attributeName, 1, #stage) == stage then
+			return index, string.sub(attributeName, #stage + 1)
+		end
+	end
+	return nil, nil
+end
+
+--Which of the pane's sections a parameter belongs in. The per-stage attributes
+--are told apart by their names, since names are how the runtime reads them, and
+--everything else by whether its value is a curve: a ParticleEmitter's
+--sequence-typed properties are exactly the ones evaluated across a particle's
+--life, which is why the test is the value's type rather than a list of names to
+--keep up to date.
+local function sectionFor(name: string, value: any): number
+	local stage, part = stageAttribute(name)
+	if stage ~= nil then
+		if part ~= nil and TIMELINE_STAGE_PARTS[part] then
+			return SECTION_TIMELINE
+		end
+		--everything else a stage names belongs to that stage's own section
+		return SECTION_STAGE_FIRST + stage - 1
+	end
+
+	if TIMELINE_ATTRIBUTES[name] then
+		return SECTION_TIMELINE
+	end
+
+	--a mesh emitter animates over particle age through attributes that say as much
+	--in their names, since an Attachment has no curve properties of its own
+	if string.find(name, "OverParticleLifetime", 1, true) ~= nil then
+		return SECTION_PARTICLE_AGE
+	end
+
+	local kind = typeof(value)
+	if kind == "NumberSequence" or kind == "ColorSequence" then
+		return SECTION_PARTICLE_AGE
+	end
+
+	return SECTION_BASE
 end
 
 --read a property defensively: the enumerated lists above may name properties
@@ -1854,10 +2015,48 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 	end
 
+	--A button small enough to sit inside a row: the "+" that adds one of a stage's
+	--attributes and the "-" that takes one away. Quiet until the mouse is on it, so
+	--that a column of them does not compete with the values beside them.
+	local function makeRowButton(text: string, color: Color3): TextButton
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.fromOffset(ROW_BUTTON_SIZE, ROW_BUTTON_SIZE)
+		button.BackgroundColor3 = theme.rowHover
+		button.BackgroundTransparency = 1
+		button.BorderSizePixel = 0
+		button.AutoButtonColor = false
+		button.Font = Enum.Font.SourceSansBold
+		button.TextSize = TEXT_SIZE + 2
+		button.TextColor3 = color
+		button.Text = text
+
+		button.MouseEnter:Connect(function()
+			button.BackgroundTransparency = 0
+			button.TextColor3 = theme.text
+		end)
+		button.MouseLeave:Connect(function()
+			button.BackgroundTransparency = 1
+			button.TextColor3 = color
+		end)
+
+		return button
+	end
+
 	--A "name    editor" parameter line. A value with no control of its own is
 	--shown as wrapped text, so the row grows downward with its editor; the name
 	--keeps a fixed height so the row's height depends only on the editor.
-	local function addParameterRow(order: number, name: string, value: any, commit: ((any) -> ())?, kind: string?)
+	--
+	--`entry` describes the row:
+	--  label     what to call it, which for a Base attribute or one of a stage's own
+	--            is shorter than the attribute's real name
+	--  value     what to show, and what kind of editor to show it with
+	--  commit    what to do with an edited value; without one the row is read-only
+	--  kind      names the editor outright for a value whose own type cannot
+	--  fullName  the attribute's real name, when the label is a shortened one: the
+	--            label is what fits in a column, but a window opened from the row has
+	--            to say which attribute of which emitter it is editing
+	--  remove    what to do when the row's "-" is clicked; without one there is none
+	local function addParameterRow(order: number, entry)
 		local row = Instance.new("Frame")
 		row.Name = "Parameter"
 		row.LayoutOrder = order
@@ -1882,14 +2081,19 @@ function VFXEditor.Create(plugin: Plugin)
 		nameLabel.TextYAlignment = Enum.TextYAlignment.Top
 		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
 		nameLabel.TextColor3 = theme.subText
-		nameLabel.Text = name
+		nameLabel.Text = entry.label
 		nameLabel.Parent = row
+
+		--A row that can be removed gives up the right-hand end of its editor to the
+		--button, so that the two never overlap; every other row keeps the full width
+		--it had.
+		local buttonRoom = if entry.remove ~= nil then ROW_BUTTON_SIZE + 4 else 0
 
 		local editor = Instance.new("Frame")
 		editor.Name = "Editor"
 		editor.AnchorPoint = Vector2.new(1, 0)
-		editor.Position = UDim2.fromScale(1, 0)
-		editor.Size = UDim2.new(1 - NAME_COLUMN, 0, 0, ROW_HEIGHT)
+		editor.Position = UDim2.new(1, -buttonRoom, 0, 0)
+		editor.Size = UDim2.new(1 - NAME_COLUMN, -buttonRoom, 0, ROW_HEIGHT)
 		editor.AutomaticSize = Enum.AutomaticSize.Y
 		editor.BackgroundTransparency = 1
 		editor.Parent = row
@@ -1897,11 +2101,36 @@ function VFXEditor.Create(plugin: Plugin)
 		--what the sequence editor puts in its titlebar, fixed now rather than at
 		--click time so a window opened from this row keeps naming this row
 		local emitter = selectedEmitter
-		local title = if emitter ~= nil then emitter.Name .. "." .. name else name
+		local qualified = entry.fullName or entry.label
+		local title = if emitter ~= nil then emitter.Name .. "." .. qualified else qualified
 
-		fillEditor(editor, value, commit, kind, title)
+		fillEditor(editor, entry.value, entry.commit, entry.kind, title)
+
+		if entry.remove ~= nil then
+			--Level with the first line rather than centred, since a row grows downward
+			--when its editor does and the button belongs to the row's own line.
+			local button = makeRowButton("-", theme.subText)
+			button.Name = "Remove"
+			button.AnchorPoint = Vector2.new(1, 0)
+			button.Position = UDim2.new(1, 0, 0, (ROW_HEIGHT - ROW_BUTTON_SIZE) // 2)
+			button.Parent = row
+
+			button.Activated:Connect(entry.remove)
+		end
 
 		return row
+	end
+
+	--The pane's rows sit flush against one another, so colouring each one reads as a
+	--single band down the whole section rather than as stripes. That is why the
+	--colour goes on the rows themselves rather than on a frame behind them, which
+	--the pane's single list layout leaves no room for anyway: a frame among the rows
+	--would be given a row's worth of space of its own.
+	local function tintRow(row: GuiObject, hue: Color3, weight: number)
+		row.BackgroundColor3 = theme.background:Lerp(hue, weight)
+		row.BackgroundTransparency = 0
+		--a border comes with the background it was hidden behind
+		row.BorderSizePixel = 0
 	end
 
 	local refreshSequences, refreshParameters, watchSelection
@@ -2085,6 +2314,81 @@ function VFXEditor.Create(plugin: Plugin)
 		requestParameterRefresh()
 	end
 
+	local function addStageAttribute(emitter: Instance, name: string, part: string)
+		if emitter.Parent == nil then
+			return
+		end
+
+		recorded("Add " .. name, function()
+			emitter:SetAttribute(name, defaultStageValue(part))
+		end)
+
+		requestParameterRefresh()
+	end
+
+	--Taking a stage attribute away leaves the driver to fall back to whatever it does
+	--when the attribute was never there, which is what the attribute's own neutral
+	--value was standing in for anyway.
+	local function removeStageAttribute(emitter: Instance, name: string)
+		if emitter.Parent == nil then
+			return
+		end
+
+		recorded("Remove " .. name, function()
+			emitter:SetAttribute(name, nil)
+		end)
+
+		requestParameterRefresh()
+	end
+
+	--What `stage` can animate on this emitter and does not yet. The stage is left off
+	--the entries, since the heading the menu drops from names it: under Hold, a
+	--"SizeScaleOverDuration" can only be HoldSizeScaleOverDuration.
+	local function stageAttributeMenu(emitter: Instance, stage: string)
+		local kind = emitterKind(emitter)
+		local parts = STAGE_ATTRIBUTE_PARTS[kind]
+
+		if parts == nil then
+			return { { text = "Nothing is animated per stage on a " .. kind .. "." } }
+		end
+
+		local items = {}
+
+		for _, part in parts do
+			if emitter:GetAttribute(stage .. part) == nil then
+				table.insert(items, {
+					text = part,
+					activate = function()
+						addStageAttribute(emitter, stage .. part, part)
+					end,
+				})
+			end
+		end
+
+		if #items == 0 then
+			table.insert(items, { text = string.format("%s animates everything it can already.", stage) })
+		end
+
+		return items
+	end
+
+	--A "+" at the right-hand end of a stage's heading. Its menu hangs off the
+	--heading rather than off the button, so that it comes out as wide as the pane: a
+	--menu the width of its anchor is what the other pickers want, but these names are
+	--long enough that one the width of a 16-pixel button would truncate every single
+	--one.
+	local function addStageAttributeButton(heading: TextLabel, emitter: Instance, stage: string)
+		local button = makeRowButton("+", theme.text)
+		button.Name = "Add"
+		button.AnchorPoint = Vector2.new(1, 0.5)
+		button.Position = UDim2.fromScale(1, 0.5)
+		button.Parent = heading
+
+		button.Activated:Connect(function()
+			openDropdown(heading, stageAttributeMenu(emitter, stage))
+		end)
+	end
+
 	function refreshParameters()
 		closeDropdown()
 		clearPane(parameterPane)
@@ -2130,9 +2434,13 @@ function VFXEditor.Create(plugin: Plugin)
 			end
 
 			for _, attributeName in sequenceNames do
-				addParameterRow(nextOrder(), attributeName, sequenceAttributes[attributeName], function(edited)
-					commitAttribute(sequence, attributeName, attributeName, edited)
-				end)
+				addParameterRow(nextOrder(), {
+					label = attributeName,
+					value = sequenceAttributes[attributeName],
+					commit = function(edited)
+						commitAttribute(sequence, attributeName, attributeName, edited)
+					end,
+				})
 			end
 
 			--emitters are picked in the timeline now that there is no column of them
@@ -2151,7 +2459,6 @@ function VFXEditor.Create(plugin: Plugin)
 		parameterPane.title.Text = string.format("Parameters - %s (%s)", emitter.Name, emitterKind(emitter))
 
 		local attributes = emitter:GetAttributes()
-		local attributeNames = {}
 		--what each attribute is called in the pane, and which native properties
 		--a Base attribute is standing in for
 		local displayNames = {}
@@ -2163,27 +2470,85 @@ function VFXEditor.Create(plugin: Plugin)
 			if shadows ~= nil then
 				shadowed[shadows] = true
 			end
-			table.insert(attributeNames, attributeName)
 		end
 
-		--sorted by what the pane calls them, so a Base attribute files under the
-		--name the author reads rather than under B
-		table.sort(attributeNames, function(a, b)
-			return displayNames[a] < displayNames[b]
-		end)
-
-		addLabelRow(parameterPane, nextOrder(), "Properties", theme.subText, true)
-
+		--Where a native property sits in its own class's list, so that a Base
+		--attribute files under the property it stands in for rather than off on its
+		--own, and so the familiar order of a class's properties survives being split
+		--across two sections.
 		local propertyNames = NATIVE_PROPERTIES[emitter.ClassName]
-		local shownProperties = 0
+		local nativeRank = {}
+		if propertyNames ~= nil then
+			for index, propertyName in propertyNames do
+				nativeRank[propertyName] = index
+			end
+		end
+
+		--Every row is described before any is drawn, so that each can be filed under
+		--the section it belongs to whether it came from a property or an attribute.
+		local sections = {}
+		for index = 1, SECTION_COUNT do
+			sections[index] = {}
+		end
+		--sorts after anything a class names itself, which is where an attribute that
+		--stands in for no property belongs
+		local UNRANKED = math.huge
+
+		local function fileRow(
+			name: string,
+			label: string,
+			value: any,
+			kind: string?,
+			onCommit: (any) -> (),
+			onRemove: (() -> ())?
+		)
+			local section = sectionFor(name, value)
+			local stage, part = stageAttribute(name)
+			local rank, within
+
+			if stage ~= nil then
+				--the stages read in playback order rather than alphabetically, so that
+				--Decay does not come before Hold
+				rank, within = stage, part or ""
+			else
+				rank, within = nativeRank[label] or UNRANKED, label
+			end
+
+			--A stage's own section names the stage, so its rows need not: under Hold, a
+			--"BrightnessScaleOverDuration" can only be HoldBrightnessScaleOverDuration.
+			--The timings are the exception and keep their full names, since all three
+			--stages' delays and durations share the one Timeline section and would
+			--otherwise come out as three rows called Delay and three called Duration.
+			local isStage = section >= SECTION_STAGE_FIRST
+
+			local shown = label
+			if isStage and part ~= nil and part ~= "" then
+				shown = part
+			end
+
+			table.insert(sections[section], {
+				label = shown,
+				fullName = name,
+				value = value,
+				kind = kind,
+				rank = rank,
+				within = within,
+				commit = onCommit,
+				--Only a stage's own attributes are offered a "-". A timing is what the
+				--timeline is drawn from and would be authored straight back the next
+				--time the effect is loaded, and a native property is not an attribute
+				--to be taken away at all.
+				remove = if isStage then onRemove else nil,
+			})
+		end
+
 		if propertyNames ~= nil then
 			for _, propertyName in propertyNames do
 				local value, ok = readProperty(emitter, propertyName)
 				if ok and not shadowed[propertyName] then
-					addParameterRow(nextOrder(), propertyName, value, function(edited)
+					fileRow(propertyName, propertyName, value, nil, function(edited)
 						commitProperty(emitter, propertyName, edited)
 					end)
-					shownProperties += 1
 				end
 			end
 		end
@@ -2193,26 +2558,57 @@ function VFXEditor.Create(plugin: Plugin)
 		if isMeshEmitter(emitter) then
 			local objectValue = emitter:FindFirstChildOfClass("ObjectValue")
 			local template = if objectValue ~= nil then objectValue.Value else nil
-			addParameterRow(nextOrder(), "MeshTemplate", template, function(edited)
+			fileRow("MeshTemplate", "MeshTemplate", template, "instance", function(edited)
 				commitMeshTemplate(emitter, edited)
-			end, "instance")
-			shownProperties += 1
+			end)
 		end
 
-		if shownProperties == 0 then
-			addLabelRow(parameterPane, nextOrder(), "No properties listed for this class.", theme.dimText, false)
+		for attributeName, value in attributes do
+			local label = displayNames[attributeName]
+			fileRow(attributeName, label, value, nil, function(edited)
+				commitAttribute(emitter, attributeName, label, edited)
+			end, function()
+				removeStageAttribute(emitter, attributeName)
+			end)
 		end
 
-		addLabelRow(parameterPane, nextOrder(), string.format("Attributes (%d)", #attributeNames), theme.subText, true)
+		--An empty section is still named, since where a parameter would appear is
+		--worth knowing before there is one there: an emitter with nothing in its
+		--last section is one with no stage curves authored yet.
+		for index, entries in sections do
+			table.sort(entries, function(a, b)
+				if a.rank ~= b.rank then
+					return a.rank < b.rank
+				end
+				return a.within < b.within
+			end)
 
-		if #attributeNames == 0 then
-			addLabelRow(parameterPane, nextOrder(), "No attributes.", theme.dimText, false)
-		else
-			for _, attributeName in attributeNames do
-				local label = displayNames[attributeName]
-				addParameterRow(nextOrder(), label, attributes[attributeName], function(edited)
-					commitAttribute(emitter, attributeName, label, edited)
-				end)
+			local hue = SECTION_HUES[index]
+
+			--full-strength text rather than the dimmed grey a heading would carry on
+			--the plain background: a tint costs contrast whichever way it goes, since
+			--it lightens a dark theme's background and darkens a light one's
+			local heading = addLabelRow(
+				parameterPane,
+				nextOrder(),
+				string.format("%s (%d)", SECTION_TITLES[index], #entries),
+				theme.text,
+				true
+			)
+			tintRow(heading, hue, SECTION_HEADING_TINT)
+
+			--the stage sections are the ones whose rows are authored rather than
+			--inherent in the class, and so the ones worth hanging a button off
+			if index >= SECTION_STAGE_FIRST then
+				addStageAttributeButton(heading, emitter, STAGES[index - SECTION_STAGE_FIRST + 1])
+			end
+
+			if #entries == 0 then
+				tintRow(addLabelRow(parameterPane, nextOrder(), "None.", theme.dimText, false), hue, SECTION_TINT)
+			end
+
+			for _, entry in entries do
+				tintRow(addParameterRow(nextOrder(), entry), hue, SECTION_TINT)
 			end
 		end
 	end
