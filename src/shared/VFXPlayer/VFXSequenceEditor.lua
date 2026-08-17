@@ -11,9 +11,18 @@
 	move it, click the surface to add one, right-click a keypoint to remove it,
 	and type exact values into the fields underneath.
 
+	A number keypoint also carries an envelope, the distance either way its value
+	is allowed to land at runtime, which the engine picks within per particle. It
+	is drawn as the two edges of a band around the curve and dragged by the
+	handles above and below the selected keypoint.
+
 	Colour sequences get a picker as well, for the same reason: Studio's colour
 	dialog has no plugin API either. It is the usual saturation/value square
 	beside a hue bar, and it edits whichever keypoint is selected.
+
+	That picker is also what a plain Color3 parameter opens, as the "color" kind:
+	the same window with the gradient, the keypoints and their times taken away,
+	leaving the square, the hue bar and the hex field to edit the one colour.
 
 	Edits are written straight back through the commit function the caller
 	passes in, one write per completed change, so each drag or typed value is a
@@ -35,7 +44,29 @@ local MARKER_SIZE = 10
 local GRADIENT_HEIGHT = 44
 local STRIP_HEIGHT = 20
 local HUE_WIDTH = 18
+--the gap between a field's label and the field, and between one field and the
+--next label along
+local LABEL_GAP = 2
+local FIELD_GAP = 6
+--The bar dragged to widen a keypoint's envelope. It runs vertically, from clear
+--of the keypoint out to the edge of the band, which is the direction it is
+--dragged in and gives a whole line's worth of it to aim at.
+local ENVELOPE_HANDLE_WIDTH = 5
+local ENVELOPE_HANDLE_MIN_LENGTH = 12
+--How far a handle stays off the keypoint it belongs to. The two are the only
+--things on the plot that are dragged, and they are dragged to different ends, so
+--the gap is what keeps a press for one from ever landing on the other.
+local ENVELOPE_HANDLE_CLEARANCE = MARKER_SIZE // 2 + 4
+--how far the envelope's own lines are taken back from the curve's, so that the
+--curve stays the thing being read
+local ENVELOPE_FADE = 0.55
+--the width of the Remove button at the right-hand end of the same row, which
+--everything laid out from the left has to stop short of
+local REMOVE_WIDTH = 66
+--the colour the cursor shows in its middle, and the two rings around it that
+--keep it visible against a colour of its own kind
 local CURSOR_SIZE = 9
+local RING_WIDTH = 1
 
 -- Roblox rejects sequences outside these bounds, so the editor never lets the
 -- keypoints leave them: at least two keypoints, at most twenty, strictly
@@ -48,6 +79,10 @@ local widget = nil
 local ui = nil
 local state = nil
 local dragIndex = nil
+-- Which keypoint's envelope the mouse is widening, if any. Mutually exclusive
+-- with dragIndex for the same reason: a press starts one drag, and the handle
+-- is a separate thing to grab from the keypoint it belongs to.
+local envelopeIndex = nil
 -- Which part of the colour picker the mouse is holding, if any: "plane" or
 -- "hue". Mutually exclusive with dragIndex, since a press starts one or the
 -- other.
@@ -63,8 +98,18 @@ local function color(guideColor: Enum.StudioStyleGuideColor, modifier: Enum.Stud
 	return settings().Studio.Theme:GetColor(guideColor, modifier)
 end
 
+--Whether the value is made of colours, and so wants the picker, the hex field
+--and the swatch.
 local function isColorKind(): boolean
-	return state.kind == "colorSequence"
+	return state.kind == "colorSequence" or state.kind == "color"
+end
+
+--Whether the value is a run of keypoints rather than a single colour. Only a
+--sequence has a surface to drag them on, times to give them, and a keypoint to
+--take away; a lone colour is held as one keypoint purely so that the picker,
+--which edits the selected one, needs no second path through.
+local function isSequenceKind(): boolean
+	return state.kind ~= "color"
 end
 
 local function toHex(value: Color3): string
@@ -96,12 +141,18 @@ end
 local function readKeypoints(kind: string, value: any)
 	local keypoints = {}
 
+	if kind == "color" then
+		return { { time = 0, color = if typeof(value) == "Color3" then value else Color3.new(1, 1, 1) } }
+	end
+
 	if value ~= nil then
 		for _, keypoint in value.Keypoints do
 			if kind == "colorSequence" then
 				table.insert(keypoints, { time = keypoint.Time, color = keypoint.Value })
 			else
-				table.insert(keypoints, { time = keypoint.Time, value = keypoint.Value })
+				--the envelope comes along whether or not it is being edited, so that
+				--a curve authored with one does not lose it to an unrelated edit
+				table.insert(keypoints, { time = keypoint.Time, value = keypoint.Value, envelope = keypoint.Envelope })
 			end
 		end
 	end
@@ -109,13 +160,19 @@ local function readKeypoints(kind: string, value: any)
 	if #keypoints < MIN_KEYPOINTS then
 		keypoints = if kind == "colorSequence"
 			then { { time = 0, color = Color3.new(1, 1, 1) }, { time = 1, color = Color3.new(1, 1, 1) } }
-			else { { time = 0, value = 1 }, { time = 1, value = 0 } }
+			else { { time = 0, value = 1, envelope = 0 }, { time = 1, value = 0, envelope = 0 } }
 	end
 
 	return keypoints
 end
 
 local function normalize()
+	--one colour has no order to put itself in, and pinning its time would only
+	--be pinning a time nothing reads
+	if not isSequenceKind() then
+		return
+	end
+
 	local keypoints = state.keypoints
 
 	table.sort(keypoints, function(a, b)
@@ -138,6 +195,10 @@ end
 -- mouse move, and a constructor that throws mid-drag would take the editor with
 -- it.
 local function buildValue(): any
+	if not isSequenceKind() then
+		return state.keypoints[1].color
+	end
+
 	local points = {}
 	local last = #state.keypoints
 	local time = 0
@@ -152,7 +213,7 @@ local function buildValue(): any
 		if isColorKind() then
 			table.insert(points, ColorSequenceKeypoint.new(time, keypoint.color))
 		else
-			table.insert(points, NumberSequenceKeypoint.new(time, keypoint.value))
+			table.insert(points, NumberSequenceKeypoint.new(time, keypoint.value, keypoint.envelope or 0))
 		end
 	end
 
@@ -163,6 +224,10 @@ end
 -- sequence is in studs -- so the plot grows to whatever the tallest keypoint
 -- needs rather than clipping it off the top. Dragging is bounded by the same
 -- ceiling, so raising a curve past its current peak is done by typing the value.
+--
+-- An envelope is measured from the top of the band it puts around a value, not
+-- from the value, or a curve at the ceiling would have its envelope drawn off
+-- the top of the plot.
 local function valueCeiling(): number
 	if isColorKind() then
 		return 1
@@ -170,7 +235,7 @@ local function valueCeiling(): number
 
 	local ceiling = 1
 	for _, keypoint in state.keypoints do
-		ceiling = math.max(ceiling, keypoint.value)
+		ceiling = math.max(ceiling, keypoint.value + (keypoint.envelope or 0))
 	end
 	return ceiling
 end
@@ -188,6 +253,25 @@ local function sampleColor(time: number): Color3
 	end
 
 	return keypoints[#keypoints].color
+end
+
+-- The envelope the curve already has at `time`, for a keypoint being inserted
+-- into a band: without this the band would pinch to nothing wherever a keypoint
+-- was added, which is never what adding one was meant to do.
+local function sampleEnvelope(time: number): number
+	local keypoints = state.keypoints
+
+	for index = 1, #keypoints - 1 do
+		local left, right = keypoints[index], keypoints[index + 1]
+		if time >= left.time and time <= right.time then
+			local span = right.time - left.time
+			local alpha = if span > 0 then (time - left.time) / span else 0
+			local from, to = left.envelope or 0, right.envelope or 0
+			return from + (to - from) * alpha
+		end
+	end
+
+	return keypoints[#keypoints].envelope or 0
 end
 
 -- The picker works in HSV while the keypoint holds RGB, and the two do not
@@ -231,7 +315,7 @@ local function addKeypoint(time: number, value: number)
 
 	local keypoint = if isColorKind()
 		then { time = time, color = sampleColor(time) }
-		else { time = time, value = value }
+		else { time = time, value = value, envelope = sampleEnvelope(time) }
 
 	table.insert(state.keypoints, keypoint)
 	table.sort(state.keypoints, function(a, b)
@@ -278,6 +362,16 @@ local function dragTo(index: number, time: number, value: number?)
 	render()
 end
 
+-- How far either way a keypoint's value is allowed to land at runtime. Set by
+-- dragging the line above or below the keypoint to wherever the band should
+-- reach, so what the mouse is holding is the edge of the band and what is stored
+-- is its distance from the value.
+local function dragEnvelopeTo(index: number, value: number)
+	local keypoint = state.keypoints[index]
+	keypoint.envelope = math.abs(value - keypoint.value)
+	render()
+end
+
 local function makeLabel(text: string, dimmed: boolean): TextLabel
 	local label = Instance.new("TextLabel")
 	label.BackgroundTransparency = 1
@@ -317,29 +411,44 @@ local function makeButton(text: string, width: number): TextButton
 	return button
 end
 
-local function makeCursor(parent: Frame): Frame
+-- The square that marks the colour in hand, and the square inside it that
+-- carries that colour. It follows the mouse through the drag, since every move
+-- writes the colour and renders again.
+--
+-- Built from filled squares nested inside one another rather than from one
+-- square wearing a border, because a border is drawn at its own frame's
+-- background transparency: a frame with nothing but a border on a transparent
+-- background draws nothing whatsoever.
+--
+-- A white ring disappears against white and a black one against black, so the
+-- cursor wears both, the dark one outside the light one. That is what keeps it
+-- findable in the corners of the square, where the colour beneath it is one or
+-- the other.
+local function makeCursor(parent: Frame): (Frame, Frame)
 	local cursor = Instance.new("Frame")
 	cursor.AnchorPoint = Vector2.new(0.5, 0.5)
-	cursor.Size = UDim2.fromOffset(CURSOR_SIZE, CURSOR_SIZE)
-	cursor.BackgroundTransparency = 1
-	cursor.BorderSizePixel = 1
-	cursor.BorderColor3 = Color3.new(1, 1, 1)
+	cursor.Size = UDim2.fromOffset(CURSOR_SIZE + RING_WIDTH * 4, CURSOR_SIZE + RING_WIDTH * 4)
+	cursor.BackgroundColor3 = Color3.new(0, 0, 0)
+	cursor.BorderSizePixel = 0
 	cursor.ZIndex = 3
 	cursor.Parent = parent
 
-	-- A white ring disappears against white and a black one against black, so
-	-- the cursor wears both, the dark one outside the light one.
-	local outline = Instance.new("Frame")
-	outline.AnchorPoint = Vector2.new(0.5, 0.5)
-	outline.Position = UDim2.fromScale(0.5, 0.5)
-	outline.Size = UDim2.new(1, 2, 1, 2)
-	outline.BackgroundTransparency = 1
-	outline.BorderSizePixel = 1
-	outline.BorderColor3 = Color3.new(0, 0, 0)
-	outline.ZIndex = 3
-	outline.Parent = cursor
+	local ring = Instance.new("Frame")
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.Size = UDim2.new(1, -RING_WIDTH * 2, 1, -RING_WIDTH * 2)
+	ring.BackgroundColor3 = Color3.new(1, 1, 1)
+	ring.BorderSizePixel = 0
+	ring.Parent = cursor
 
-	return cursor
+	local fill = Instance.new("Frame")
+	fill.AnchorPoint = Vector2.new(0.5, 0.5)
+	fill.Position = UDim2.fromScale(0.5, 0.5)
+	fill.Size = UDim2.new(1, -RING_WIDTH * 2, 1, -RING_WIDTH * 2)
+	fill.BorderSizePixel = 0
+	fill.Parent = ring
+
+	return cursor, fill
 end
 
 -- The saturation/value square is a hue-coloured panel under two gradients: white
@@ -376,7 +485,7 @@ local function buildPicker(container: Frame, top: number, bottom: number)
 	brightnessRamp.Transparency = NumberSequence.new(1, 0)
 	brightnessRamp.Parent = brightness
 
-	ui.planeCursor = makeCursor(plane)
+	ui.planeCursor, ui.planeCursorFill = makeCursor(plane)
 
 	local hue = Instance.new("Frame")
 	hue.Position = UDim2.new(1, -(PADDING + HUE_WIDTH), 0, top)
@@ -399,8 +508,10 @@ local function buildPicker(container: Frame, top: number, bottom: number)
 	hueRamp.Color = ColorSequence.new(hueStops)
 	hueRamp.Parent = hue
 
-	ui.hueCursor = makeCursor(hue)
-	ui.hueCursor.Size = UDim2.new(1, 4, 0, CURSOR_SIZE)
+	-- The hue cursor spans the bar it sits on, overhanging a little at both ends
+	-- so that the ring reads as a band across it rather than a square on it.
+	ui.hueCursor, ui.hueCursorFill = makeCursor(hue)
+	ui.hueCursor.Size = UDim2.new(1, RING_WIDTH * 4, 0, CURSOR_SIZE + RING_WIDTH * 4)
 
 	plane.InputBegan:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
@@ -433,11 +544,12 @@ local function build()
 	ui = {}
 
 	function ui.endDrag()
-		if dragIndex == nil and pickerDrag == nil then
+		if dragIndex == nil and envelopeIndex == nil and pickerDrag == nil then
 			return
 		end
 
 		dragIndex = nil
+		envelopeIndex = nil
 		pickerDrag = nil
 
 		if dragMoved then
@@ -486,7 +598,7 @@ local function build()
 			return
 		end
 
-		if dragIndex == nil then
+		if dragIndex == nil and envelopeIndex == nil then
 			return
 		end
 
@@ -500,6 +612,14 @@ local function build()
 		local value = if isColorKind() then nil else math.clamp(1 - position.Y / size.Y, 0, 1) * valueCeiling()
 
 		dragMoved = true
+
+		--an envelope is dragged up and down only: it belongs to a keypoint that
+		--stays where it is
+		if envelopeIndex ~= nil then
+			dragEnvelopeTo(envelopeIndex, value or 0)
+			return
+		end
+
 		dragTo(dragIndex, time, value)
 	end
 
@@ -525,50 +645,62 @@ local function build()
 
 	local bottomStack = PADDING + HINT_HEIGHT + 4 + ROW_HEIGHT + PADDING
 
-	-- The colour editor is a gradient with its keypoints on a strip below it,
-	-- the number editor a plot with the keypoints on it. Both drag the same way,
-	-- so only the surface differs.
-	local surface = Instance.new("Frame")
-	surface.Position = UDim2.fromOffset(PADDING, SURFACE_TOP)
-	surface.BackgroundColor3 = color(Enum.StudioStyleGuideColor.InputFieldBackground)
-	surface.BorderColor3 = color(Enum.StudioStyleGuideColor.Border)
-	surface.Parent = root
-	ui.surface = surface
+	-- Where the picker starts. A lone colour has no keypoints to lay along
+	-- anything, so nothing stands between the title and the square.
+	local pickerTop = SURFACE_TOP
 
-	if isColorKind() then
-		surface.Size = UDim2.new(1, -PADDING * 2, 0, GRADIENT_HEIGHT)
-		-- A UIGradient multiplies the frame's own colour rather than replacing
-		-- it, so anything it is laid over has to be white or the whole ramp
-		-- comes out dimmed by whatever the theme painted underneath.
-		surface.BackgroundColor3 = Color3.new(1, 1, 1)
+	if isSequenceKind() then
+		-- The colour editor is a gradient with its keypoints on a strip below
+		-- it, the number editor a plot with the keypoints on it. Both drag the
+		-- same way, so only the surface differs.
+		local surface = Instance.new("Frame")
+		surface.Position = UDim2.fromOffset(PADDING, SURFACE_TOP)
+		surface.BackgroundColor3 = color(Enum.StudioStyleGuideColor.InputFieldBackground)
+		surface.BorderColor3 = color(Enum.StudioStyleGuideColor.Border)
+		surface.Parent = root
+		ui.surface = surface
 
-		local gradient = Instance.new("UIGradient")
-		gradient.Parent = surface
-		ui.gradient = gradient
+		if isColorKind() then
+			surface.Size = UDim2.new(1, -PADDING * 2, 0, GRADIENT_HEIGHT)
+			-- A UIGradient multiplies the frame's own colour rather than
+			-- replacing it, so anything it is laid over has to be white or the
+			-- whole ramp comes out dimmed by whatever the theme painted
+			-- underneath.
+			surface.BackgroundColor3 = Color3.new(1, 1, 1)
 
-		local strip = Instance.new("Frame")
-		strip.Position = UDim2.fromOffset(PADDING, SURFACE_TOP + GRADIENT_HEIGHT)
-		strip.Size = UDim2.new(1, -PADDING * 2, 0, STRIP_HEIGHT)
-		strip.BackgroundTransparency = 1
-		strip.Parent = root
-		ui.markers = strip
-	else
-		surface.Size = UDim2.new(1, -PADDING * 2, 1, -(SURFACE_TOP + bottomStack))
-		ui.markers = surface
+			local gradient = Instance.new("UIGradient")
+			gradient.Parent = surface
+			ui.gradient = gradient
+
+			local strip = Instance.new("Frame")
+			strip.Position = UDim2.fromOffset(PADDING, SURFACE_TOP + GRADIENT_HEIGHT)
+			strip.Size = UDim2.new(1, -PADDING * 2, 0, STRIP_HEIGHT)
+			strip.BackgroundTransparency = 1
+			strip.Parent = root
+			ui.markers = strip
+
+			pickerTop = SURFACE_TOP + GRADIENT_HEIGHT + STRIP_HEIGHT + PADDING
+		else
+			surface.Size = UDim2.new(1, -PADDING * 2, 1, -(SURFACE_TOP + bottomStack))
+			ui.markers = surface
+		end
+
+		-- The curve is redrawn from scratch every render; the keypoint buttons
+		-- are not, so they live alongside it rather than among it.
+		local curve = Instance.new("Frame")
+		curve.Size = UDim2.fromScale(1, 1)
+		curve.BackgroundTransparency = 1
+		curve.ZIndex = 1
+		curve.Parent = ui.markers
+		ui.curve = curve
+		ui.markerButtons = {}
+		--kept by which side of the value they sit on rather than in a list, since
+		--there is one above and one below and they are reused like the markers
+		ui.envelopeHandles = {}
 	end
 
-	-- The curve is redrawn from scratch every render; the keypoint buttons are
-	-- not, so they live alongside it rather than among it.
-	local curve = Instance.new("Frame")
-	curve.Size = UDim2.fromScale(1, 1)
-	curve.BackgroundTransparency = 1
-	curve.ZIndex = 1
-	curve.Parent = ui.markers
-	ui.curve = curve
-	ui.markerButtons = {}
-
 	if isColorKind() then
-		buildPicker(root, SURFACE_TOP + GRADIENT_HEIGHT + STRIP_HEIGHT + PADDING, bottomStack)
+		buildPicker(root, pickerTop, bottomStack)
 	end
 
 	local fields = Instance.new("Frame")
@@ -577,55 +709,100 @@ local function build()
 	fields.BackgroundTransparency = 1
 	fields.Parent = root
 
-	local timeLabel = makeLabel("Time", true)
-	timeLabel.Position = UDim2.fromOffset(0, 0)
-	timeLabel.Size = UDim2.fromOffset(34, ROW_HEIGHT)
-	timeLabel.Parent = fields
+	-- The row is filled left to right rather than at written-out offsets, because
+	-- what goes in it varies: a number's keypoint has a time, a value and an
+	-- envelope, a colour's has a time and a colour, and a lone colour has only the
+	-- colour. Each piece takes the width it needs from where the last one ended.
+	local fieldLeft = 0
 
-	ui.timeBox = makeTextBox(56, 36)
-	ui.timeBox.Parent = fields
+	local function placeLabel(text: string, width: number)
+		local label = makeLabel(text, true)
+		label.Position = UDim2.fromOffset(fieldLeft, 0)
+		label.Size = UDim2.fromOffset(width, ROW_HEIGHT)
+		label.Parent = fields
+		fieldLeft += width + LABEL_GAP
+	end
 
-	local valueLabel = makeLabel(if isColorKind() then "Color" else "Value", true)
-	valueLabel.Position = UDim2.fromOffset(102, 0)
-	valueLabel.Size = UDim2.fromOffset(40, ROW_HEIGHT)
-	valueLabel.Parent = fields
+	local function placeBox(width: number): TextBox
+		local box = makeTextBox(width, fieldLeft)
+		box.Parent = fields
+		fieldLeft += width + FIELD_GAP
+		return box
+	end
 
-	ui.valueBox = makeTextBox(if isColorKind() then 76 else 56, 144)
-	ui.valueBox.Parent = fields
+	if isSequenceKind() then
+		placeLabel("Time", 30)
+		ui.timeBox = placeBox(48)
+	end
+
+	placeLabel(if isColorKind() then "Color" else "Value", 34)
+	ui.valueBox = placeBox(if isColorKind() then 72 else 48)
 
 	if isColorKind() then
 		local swatch = Instance.new("Frame")
-		swatch.Position = UDim2.fromOffset(226, 2)
+		swatch.Position = UDim2.fromOffset(fieldLeft, 2)
 		swatch.Size = UDim2.fromOffset(ROW_HEIGHT - 4, ROW_HEIGHT - 4)
 		swatch.BorderColor3 = color(Enum.StudioStyleGuideColor.Border)
 		swatch.Parent = fields
 		ui.swatch = swatch
+		fieldLeft += ROW_HEIGHT - 4 + FIELD_GAP
+	else
+		--How far either way the value may land, which is the one thing here that
+		--is a property of the curve rather than of the keypoint's place on it.
+		placeLabel("Env", 26)
+		ui.envelopeBox = placeBox(48)
 	end
 
-	ui.removeButton = makeButton("Remove", 66)
-	ui.removeButton.AnchorPoint = Vector2.new(1, 0)
-	ui.removeButton.Position = UDim2.new(1, 0, 0, 2)
-	ui.removeButton.Parent = fields
+	if isSequenceKind() then
+		ui.removeButton = makeButton("Remove", REMOVE_WIDTH)
+		ui.removeButton.AnchorPoint = Vector2.new(1, 0)
+		ui.removeButton.Position = UDim2.new(1, 0, 0, 2)
+		ui.removeButton.Parent = fields
+	end
 
-	local hint = makeLabel(
-		if isColorKind()
-			then "Click the gradient to add a keypoint, right-click one to remove it."
-			else "Click to add a keypoint. Right-click one to remove it.",
-		true
-	)
+	local hintText = "Click to add a keypoint, right-click one to remove it. Drag a handle to vary its value."
+	if not isSequenceKind() then
+		hintText = "Drag the square and the hue bar, or type a hex colour."
+	elseif isColorKind() then
+		hintText = "Click the gradient to add a keypoint, right-click one to remove it."
+	end
+
+	local hint = makeLabel(hintText, true)
 	hint.Position = UDim2.new(0, PADDING, 1, -(PADDING + HINT_HEIGHT))
 	hint.Size = UDim2.new(1, -PADDING * 2, 0, HINT_HEIGHT)
 	hint.Parent = root
 
-	ui.timeBox.FocusLost:Connect(function()
-		local time = tonumber(ui.timeBox.Text)
-		if time ~= nil then
-			dragTo(state.selected, math.clamp(time, 0, 1), nil)
-			commit()
-		else
+	if isSequenceKind() then
+		ui.timeBox.FocusLost:Connect(function()
+			local time = tonumber(ui.timeBox.Text)
+			if time ~= nil then
+				dragTo(state.selected, math.clamp(time, 0, 1), nil)
+				commit()
+			else
+				render()
+			end
+		end)
+
+		ui.removeButton.Activated:Connect(function()
+			removeKeypoint(state.selected)
+		end)
+	end
+
+	if ui.envelopeBox ~= nil then
+		ui.envelopeBox.FocusLost:Connect(function()
+			local parsed = tonumber(ui.envelopeBox.Text)
+			if parsed ~= nil then
+				--an envelope is a distance either way, so it has no sign; typing a
+				--bigger one than the plot shows grows the plot rather than being
+				--refused, the same as typing a value does
+				state.keypoints[state.selected].envelope = math.max(parsed, 0)
+				commit()
+				return
+			end
+
 			render()
-		end
-	end)
+		end)
+	end
 
 	ui.valueBox.FocusLost:Connect(function()
 		local keypoint = state.keypoints[state.selected]
@@ -649,26 +826,33 @@ local function build()
 		render()
 	end)
 
-	ui.removeButton.Activated:Connect(function()
-		removeKeypoint(state.selected)
-	end)
+	if isSequenceKind() then
+		-- Clicking anywhere on the surface that is not a keypoint adds one.
+		-- Keypoints are buttons and take the click first, setting dragIndex on
+		-- the way, which is what keeps a grab from also inserting a point
+		-- underneath itself.
+		ui.surface.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 or dragIndex ~= nil then
+				return
+			end
 
-	-- Clicking anywhere on the surface that is not a keypoint adds one. Keypoints
-	-- are buttons and take the click first, setting dragIndex on the way, which
-	-- is what keeps a grab from also inserting a point underneath itself.
-	surface.InputBegan:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 or dragIndex ~= nil then
-			return
-		end
+			local position = surfaceLocalPosition(input)
+			local size = ui.surface.AbsoluteSize
+			if size.X <= 0 or size.Y <= 0 then
+				return
+			end
 
-		local position = surfaceLocalPosition(input)
-		local size = surface.AbsoluteSize
-		if size.X <= 0 or size.Y <= 0 then
-			return
-		end
+			addKeypoint(position.X / size.X, (1 - position.Y / size.Y) * valueCeiling())
+		end)
 
-		addKeypoint(position.X / size.X, (1 - position.Y / size.Y) * valueCeiling())
-	end)
+		-- The curve between the keypoints is drawn in pixels, so it has to be
+		-- drawn again whenever the surface it spans changes size.
+		ui.surface:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			if state ~= nil then
+				render()
+			end
+		end)
+	end
 
 	-- Tracked on the root rather than the surface so a drag that wanders off the
 	-- plot keeps working until the mouse comes back or is released. Keypoint
@@ -676,12 +860,6 @@ local function build()
 	-- and the drag survives passing over them.
 	root.InputChanged:Connect(ui.onDragMove)
 	root.InputEnded:Connect(ui.onDragEnd)
-
-	surface:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-		if state ~= nil then
-			render()
-		end
-	end)
 end
 
 -- A marker always stands for the keypoint at its own index. Keypoints never
@@ -693,7 +871,9 @@ local function createMarker(index: number): TextButton
 	marker.Size = UDim2.fromOffset(MARKER_SIZE, MARKER_SIZE)
 	marker.Text = ""
 	marker.AutoButtonColor = false
-	marker.ZIndex = 2
+	--above the envelope handles, so that the keypoint takes the press if the two
+	--are ever drawn over one another
+	marker.ZIndex = 3
 
 	marker.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -717,6 +897,42 @@ local function createMarker(index: number): TextButton
 	return marker
 end
 
+-- A handle stands for one edge of one keypoint's envelope: `side` is 1 for the
+-- one above the value and -1 for the one below. Dragging either sets the same
+-- envelope, since the band is symmetrical.
+--
+-- Anchored at whichever end of itself is nearest the keypoint, so that it is
+-- placed by the gap it keeps from the keypoint and grows away from it as the
+-- envelope widens.
+local function createEnvelopeHandle(side: number): TextButton
+	local handle = Instance.new("TextButton")
+	handle.Name = if side > 0 then "EnvelopeTop" else "EnvelopeBottom"
+	handle.AnchorPoint = Vector2.new(0.5, if side > 0 then 1 else 0)
+	handle.Text = ""
+	handle.AutoButtonColor = false
+	handle.BorderSizePixel = 0
+	handle.ZIndex = 2
+	handle.Visible = false
+
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			envelopeIndex = state.selected
+			dragMoved = false
+		end
+	end)
+
+	handle.InputChanged:Connect(function(input)
+		ui.onDragMove(input)
+	end)
+
+	handle.InputEnded:Connect(function(input)
+		ui.onDragEnd(input)
+	end)
+
+	handle.Parent = ui.markers
+	return handle
+end
+
 local function renderMarkers()
 	local keypoints = state.keypoints
 	local markers = ui.markerButtons
@@ -727,23 +943,91 @@ local function renderMarkers()
 		segment:Destroy()
 	end
 
-	-- Segments are drawn as thin rotated frames between consecutive keypoints,
-	-- which needs pixel positions; the render re-runs when the surface resizes.
+	-- A line between two points on the plot, drawn as a thin rotated frame, which
+	-- is why this needs pixel positions and why the render re-runs when the
+	-- surface resizes.
+	local function drawLine(x1: number, y1: number, x2: number, y2: number, thickness: number, faded: number)
+		local dx, dy = x2 - x1, y2 - y1
+
+		local segment = Instance.new("Frame")
+		segment.AnchorPoint = Vector2.new(0.5, 0.5)
+		segment.Position = UDim2.fromOffset((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+		segment.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), thickness)
+		segment.Rotation = math.deg(math.atan2(dy, dx))
+		segment.BackgroundColor3 = color(Enum.StudioStyleGuideColor.DialogMainButton)
+		segment.BackgroundTransparency = faded
+		segment.BorderSizePixel = 0
+		segment.Parent = ui.curve
+	end
+
 	if not isColorKind() and size.X > 0 and size.Y > 0 then
+		local function plotY(value: number): number
+			return (1 - value / ceiling) * size.Y
+		end
+
 		for index = 1, #keypoints - 1 do
 			local left, right = keypoints[index], keypoints[index + 1]
-			local x1, y1 = left.time * size.X, (1 - left.value / ceiling) * size.Y
-			local x2, y2 = right.time * size.X, (1 - right.value / ceiling) * size.Y
-			local dx, dy = x2 - x1, y2 - y1
+			local x1, x2 = left.time * size.X, right.time * size.X
+			local leftEnvelope, rightEnvelope = left.envelope or 0, right.envelope or 0
 
-			local segment = Instance.new("Frame")
-			segment.AnchorPoint = Vector2.new(0.5, 0.5)
-			segment.Position = UDim2.fromOffset((x1 + x2) * 0.5, (y1 + y2) * 0.5)
-			segment.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), 2)
-			segment.Rotation = math.deg(math.atan2(dy, dx))
-			segment.BackgroundColor3 = color(Enum.StudioStyleGuideColor.DialogMainButton)
-			segment.BorderSizePixel = 0
-			segment.Parent = ui.curve
+			-- The envelope is the range a value may actually land in, so it is
+			-- drawn as the two edges of a band around the curve. Studio shades the
+			-- band in; a UI frame cannot be a trapezoid, so the edges carry it
+			-- here, dimmed so they read as the bounds rather than as more curves.
+			if leftEnvelope > 0 or rightEnvelope > 0 then
+				for _, side in { 1, -1 } do
+					drawLine(
+						x1,
+						plotY(left.value + side * leftEnvelope),
+						x2,
+						plotY(right.value + side * rightEnvelope),
+						1,
+						ENVELOPE_FADE
+					)
+				end
+			end
+
+			drawLine(x1, plotY(left.value), x2, plotY(right.value), 2, 0)
+		end
+
+		-- Whichever keypoint is selected gets the handles, so that a curve with an
+		-- envelope on every keypoint is not buried under forty of them.
+		local selected = keypoints[state.selected]
+		local envelope = selected.envelope or 0
+		local originX, originY = selected.time * size.X, plotY(selected.value)
+
+		for _, side in { 1, -1 } do
+			local handle = ui.envelopeHandles[side]
+			if handle == nil then
+				handle = createEnvelopeHandle(side)
+				ui.envelopeHandles[side] = handle
+			end
+
+			--Where the handle starts, which is clear of the keypoint whatever the
+			--envelope is doing: that gap is the whole reason a press can only ever
+			--mean one of the two.
+			local near = originY - side * ENVELOPE_HANDLE_CLEARANCE
+			--how much of the plot is left between there and the edge it grows
+			--towards, so a whisker is never drawn outside the plot
+			local room = if side > 0 then near else size.Y - near
+
+			--The rest of the way to the edge of the band, once the gap has been
+			--taken off, and never so short that there is nothing to aim at. A
+			--keypoint hard against the top or bottom of the plot has no room for
+			--the handle on that side, which is also the side its envelope has
+			--nowhere to reach into; the other one sets the same envelope.
+			local reach = math.abs(plotY(selected.value + side * envelope) - originY)
+			local length = math.clamp(
+				math.max(reach - ENVELOPE_HANDLE_CLEARANCE, ENVELOPE_HANDLE_MIN_LENGTH),
+				0,
+				math.max(room, 0)
+			)
+
+			handle.Visible = length > 0
+			handle.Size = UDim2.fromOffset(ENVELOPE_HANDLE_WIDTH, length)
+			handle.Position = UDim2.fromOffset(originX, near)
+			handle.BackgroundColor3 = color(Enum.StudioStyleGuideColor.DialogMainButton)
+			handle.BackgroundTransparency = if envelope > 0 then 0 else ENVELOPE_FADE
 		end
 	end
 
@@ -791,15 +1075,32 @@ render = function()
 	if isColorKind() then
 		syncPicker()
 
-		ui.gradient.Color = buildValue()
+		if isSequenceKind() then
+			ui.gradient.Color = buildValue()
+		end
+
 		ui.swatch.BackgroundColor3 = keypoint.color
 		ui.valueBox.Text = "#" .. toHex(keypoint.color)
 
-		ui.plane.BackgroundColor3 = Color3.fromHSV(state.hue, 1, 1)
+		local pureHue = Color3.fromHSV(state.hue, 1, 1)
+
+		ui.plane.BackgroundColor3 = pureHue
 		ui.planeCursor.Position = UDim2.fromScale(state.sat, 1 - state.val)
+		--the colour in hand, so the cursor reads as the swatch it is standing on
+		ui.planeCursorFill.BackgroundColor3 = keypoint.color
+
 		ui.hueCursor.Position = UDim2.fromScale(0.5, state.hue)
+		--the hue alone, which is what this bar picks rather than the whole colour
+		ui.hueCursorFill.BackgroundColor3 = pureHue
 	else
 		ui.valueBox.Text = string.format("%g", keypoint.value)
+		ui.envelopeBox.Text = string.format("%g", keypoint.envelope or 0)
+	end
+
+	--the rest of the window is the keypoints and what can be done to them, none
+	--of which a lone colour has
+	if not isSequenceKind() then
+		return
 	end
 
 	ui.timeBox.Text = string.format("%g", keypoint.time)
@@ -821,9 +1122,10 @@ render = function()
 end
 
 --[[
-	Opens the editor on one parameter. `kind` is "numberSequence" or
-	"colorSequence". `commit` is called with a rebuilt sequence after every
-	completed edit; the caller owns how that reaches the instance, so undo
+	Opens the editor on one parameter. `kind` is "numberSequence",
+	"colorSequence" or "color", the last being a single Color3 rather than a
+	sequence. `commit` is called with a rebuilt value of that same type after
+	every completed edit; the caller owns how that reaches the instance, so undo
 	history stays in one place.
 ]]
 function VFXSequenceEditor.Open(pluginRef: Plugin, title: string, kind: string, value: any, onCommit: (any) -> ())

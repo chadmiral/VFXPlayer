@@ -1,7 +1,7 @@
---Studio-only inspector window for the VFX in a place. A band of playback
---controls across the top, and under it three panes, left to right: every
---instance tagged "VFXSequence", the emitters inside the selected sequence, and
---the native properties plus attributes of the selected emitter.
+--Studio-only inspector window for the VFX in a place, reading top to bottom: a
+--band of playback controls, then the effect being edited, picked from everything
+--tagged "VFXSequence"; then a timeline with a row per emitter inside it; then the
+--native properties and attributes of whichever of those rows is selected.
 local VFXEditor = {}
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
@@ -28,6 +28,10 @@ local TEXT_SIZE = 14
 local PADDING = 8
 --the playback band above the panes, and the size of a button in it
 local TOOLBAR_HEIGHT = 32
+--the band under the buttons holding the one control that says which effect all of
+--this is about, and the two bands together, which is what the timeline sits below
+local SELECTOR_HEIGHT = 28
+local CONTROLS_HEIGHT = TOOLBAR_HEIGHT + SELECTOR_HEIGHT
 --the buttons are square and carry nothing but their icon, with what each one does
 --in a tooltip rather than on its face
 local BUTTON_SIZE = 22
@@ -45,9 +49,9 @@ local TIMELINE_NAME_WIDTH = 118
 local TIMELINE_AXIS_HEIGHT = 16
 local TIMELINE_MAX_ROWS = 10
 local TIMELINE_SCROLLBAR = 6
---the room the three panes are always left with, which is what decides how many
+--the room the parameters are always left with, which is what decides how many
 --rows the band may take for itself
-local TIMELINE_MIN_PANES = 140
+local TIMELINE_MIN_PANE = 140
 --Where a row's bar starts and stops, which the lines drawn across every row
 --share. The rows always reserve the scroll bar so this column is the same width
 --whether the bar is showing or not, and the lines cannot drift out of step.
@@ -148,6 +152,10 @@ local NAME_COLUMN = 0.45
 --the small square buttons that live inside a row: the "+" on a stage's heading and
 --the "-" on each of its parameters
 local ROW_BUTTON_SIZE = ROW_HEIGHT - 6
+--the colour a colour row shows in front of its numbers, and how far in from the
+--field's edge it sits
+local SWATCH_SIZE = ROW_HEIGHT - 10
+local SWATCH_INSET = 3
 
 --Roblox exposes no property reflection to plugins, so the native properties
 --worth showing for each driven class are enumerated here, in display order.
@@ -580,10 +588,12 @@ function VFXEditor.Create(plugin: Plugin)
 	local selectedSequence: Instance? = nil
 	local selectedEmitter: Instance? = nil
 
-	--Picking an emitter redraws the panes and the timeline, all of which are built
-	--below, but the toolbar and the timeline rows above both need to ask for it, so
-	--it is named here and defined down there. The same goes for the picker list,
-	--which the parameter rows and the Add Emitter button both raise.
+	--Picking a sequence or an emitter redraws the pane and the timeline, all of
+	--which are built below, but the controls at the top of the window need to ask
+	--for it, so they are named here and defined down there. The same goes for the
+	--picker list, which the sequence control, the parameter rows and the Add
+	--Emitter button all raise.
+	local selectSequence
 	local selectEmitter
 	local openDropdown
 
@@ -611,8 +621,8 @@ function VFXEditor.Create(plugin: Plugin)
 	toolbar.Size = UDim2.new(1, 0, 0, TOOLBAR_HEIGHT)
 	toolbar.BorderSizePixel = 0
 	toolbar.BackgroundColor3 = theme.header
-	--the target name grows with the text, so a long one is cut at the window
-	--edge rather than drawn past it
+	--a window too narrow for the buttons cuts them off at its edge rather than
+	--drawing them over the band below
 	toolbar.ClipsDescendants = true
 	toolbar.Parent = root
 
@@ -730,20 +740,73 @@ function VFXEditor.Create(plugin: Plugin)
 	local addButton, addIcon = makeToolbarButton("Add Emitter", 3, string.format(ADD_ICON, variant))
 	local deleteButton, deleteIcon = makeToolbarButton("Delete Emitter", 4, string.format(DELETE_ICON, variant))
 
-	--Play acts on the pane's selection rather than the hierarchy's, which is not
-	--something a button can show on its own, so the target is named beside it.
-	local playTarget = Instance.new("TextLabel")
-	playTarget.Name = "PlayTarget"
-	playTarget.LayoutOrder = 5
-	playTarget.AutomaticSize = Enum.AutomaticSize.X
-	playTarget.Size = UDim2.fromOffset(0, ROW_HEIGHT)
-	playTarget.BackgroundTransparency = 1
-	playTarget.Font = Enum.Font.SourceSans
-	playTarget.TextSize = TEXT_SIZE
-	playTarget.TextXAlignment = Enum.TextXAlignment.Left
-	playTarget.TextColor3 = theme.dimText
-	playTarget.Text = ""
-	playTarget.Parent = toolbar
+	--The effect being edited, picked here because everything below shows this one
+	--sequence and nothing else: the timeline is its emitters, the pane is their
+	--parameters, and the buttons act on it. It replaces a column that listed every
+	--tagged effect down the left of the window, which spent a third of the width
+	--on names that were only ever read once, to choose from.
+	local selectorBand = Instance.new("Frame")
+	selectorBand.Name = "Sequence"
+	selectorBand.Position = UDim2.fromOffset(0, TOOLBAR_HEIGHT)
+	selectorBand.Size = UDim2.new(1, 0, 0, SELECTOR_HEIGHT)
+	selectorBand.BorderSizePixel = 0
+	selectorBand.BackgroundColor3 = theme.header
+	selectorBand.Parent = root
+
+	--Dressed as a field rather than a button, which is how the parameter rows that
+	--drop a list of their own read, and left where a title would be so that it
+	--names the window's subject as much as it chooses it.
+	local sequenceButton = Instance.new("TextButton")
+	sequenceButton.Name = "Picker"
+	sequenceButton.Position = UDim2.fromOffset(PADDING, (SELECTOR_HEIGHT - ROW_HEIGHT) // 2)
+	sequenceButton.Size = UDim2.new(1, -PADDING * 2, 0, ROW_HEIGHT)
+	sequenceButton.BackgroundColor3 = theme.inputBackground
+	sequenceButton.BorderColor3 = theme.inputBorder
+	sequenceButton.Font = Enum.Font.SourceSans
+	sequenceButton.TextSize = TEXT_SIZE
+	sequenceButton.TextColor3 = theme.text
+	sequenceButton.TextXAlignment = Enum.TextXAlignment.Left
+	sequenceButton.TextTruncate = Enum.TextTruncate.AtEnd
+	sequenceButton.Text = ""
+	sequenceButton.Parent = selectorBand
+
+	local sequencePadding = Instance.new("UIPadding")
+	sequencePadding.PaddingLeft = UDim.new(0, 4)
+	sequencePadding.PaddingRight = UDim.new(0, 4)
+	sequencePadding.Parent = sequenceButton
+
+	--Every tagged effect, by name, with its parent named after it so that two
+	--effects called the same thing can still be told apart, which is what the old
+	--column's dimmed second half was for. Gathered when the list is opened rather
+	--than kept in step with the tag, since a list that only exists while it is
+	--being read cannot go stale.
+	local function sequenceItems()
+		local sequences = CollectionService:GetTagged(VFX_SEQUENCE_TAG)
+		table.sort(sequences, function(a, b)
+			return a.Name < b.Name
+		end)
+
+		local items = {}
+		for _, sequence in sequences do
+			local parent = sequence.Parent
+			table.insert(items, {
+				text = if parent ~= nil then string.format("%s  (%s)", sequence.Name, parent.Name) else sequence.Name,
+				activate = function()
+					selectSequence(sequence)
+				end,
+			})
+		end
+
+		if #items == 0 then
+			table.insert(items, { text = "Nothing is tagged 'VFXSequence'." })
+		end
+
+		return items
+	end
+
+	sequenceButton.Activated:Connect(function()
+		openDropdown(sequenceButton, sequenceItems())
+	end)
 
 	--The window owns the buttons but not the playback engine, so what they
 	--actually do is supplied by the caller.
@@ -846,24 +909,21 @@ function VFXEditor.Create(plugin: Plugin)
 		setButtonEnabled(addButton, addIcon, haveSequence)
 		setButtonEnabled(deleteButton, deleteIcon, selectedEmitter ~= nil)
 
-		playTarget.Text = if sequence ~= nil then sequence.Name else "Select a sequence to play."
+		--The picker names what everything below it is showing, and what the buttons
+		--beside it will act on, so with nothing picked it says to pick something
+		--rather than sitting there empty.
+		sequenceButton.Text = if sequence ~= nil then sequence.Name else "Choose a VFX sequence..."
+		sequenceButton.TextColor3 = if sequence ~= nil then theme.text else theme.dimText
 	end
 
-	--The panes are laid out inside their own frame rather than directly in the
-	--root, because a UIListLayout arranges every child it can see: an overlay
-	--dropped into the root would be given a column of its own and push the panes
-	--out of the window. The root is left as plain space for things that sit on
-	--top of the layout instead of in it.
+	--Whatever room is left under the timeline, which is where the parameters go.
+	--The band above is the one that knows how tall it needs to be, so it is what
+	--positions and sizes this.
 	local paneHolder = Instance.new("Frame")
 	paneHolder.Name = "Panes"
 	paneHolder.BackgroundTransparency = 1
 	paneHolder.BorderSizePixel = 0
 	paneHolder.Parent = root
-
-	local paneLayout = Instance.new("UIListLayout")
-	paneLayout.FillDirection = Enum.FillDirection.Horizontal
-	paneLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	paneLayout.Parent = paneHolder
 
 	--The stage timeline. One row per emitter in the selected sequence, each
 	--showing stand, hold and decay laid end to end with their delays between
@@ -871,7 +931,7 @@ function VFXEditor.Create(plugin: Plugin)
 	--other and a single line marks where playback has reached across all of them.
 	local timelineBand = Instance.new("Frame")
 	timelineBand.Name = "Timeline"
-	timelineBand.Position = UDim2.fromOffset(0, TOOLBAR_HEIGHT)
+	timelineBand.Position = UDim2.fromOffset(0, CONTROLS_HEIGHT)
 	timelineBand.BorderSizePixel = 0
 	timelineBand.BackgroundColor3 = theme.header
 	timelineBand.Parent = root
@@ -984,7 +1044,7 @@ function VFXEditor.Create(plugin: Plugin)
 	local function setTimelineHeight(rowCount: number)
 		timelineRowCount = rowCount
 
-		local spare = root.AbsoluteSize.Y - TOOLBAR_HEIGHT - TIMELINE_AXIS_HEIGHT - TIMELINE_MIN_PANES
+		local spare = root.AbsoluteSize.Y - CONTROLS_HEIGHT - TIMELINE_AXIS_HEIGHT - TIMELINE_MIN_PANE
 		local allowed = math.clamp(spare // TIMELINE_ROW_HEIGHT, 1, TIMELINE_MAX_ROWS)
 		local visibleRows = math.clamp(rowCount, 1, allowed)
 		local height = 2 + visibleRows * TIMELINE_ROW_HEIGHT + TIMELINE_AXIS_HEIGHT
@@ -992,7 +1052,7 @@ function VFXEditor.Create(plugin: Plugin)
 		timelineBand.Size = UDim2.new(1, 0, 0, height)
 		rows.Size = UDim2.new(1, 0, 0, visibleRows * TIMELINE_ROW_HEIGHT)
 
-		local top = TOOLBAR_HEIGHT + height
+		local top = CONTROLS_HEIGHT + height
 		toolbarDivider.Position = UDim2.fromOffset(0, top - 1)
 		paneHolder.Position = UDim2.fromOffset(0, top)
 		paneHolder.Size = UDim2.new(1, 0, 1, -top)
@@ -1197,8 +1257,8 @@ function VFXEditor.Create(plugin: Plugin)
 	end
 
 	--One emitter's row: its name, then its stages on the shared axis. Clicking it
-	--picks that emitter, the same as picking it in the middle pane, so the rows
-	--can be used to navigate rather than only to read.
+	--picks that emitter, so the rows are how an emitter is chosen and not only how
+	--its timing is read.
 	--Which name was clicked and when. Picking a row rebuilds every row, so the first
 	--click of a double click destroys the very label the second one lands on, and
 	--none of this can be remembered on the row itself.
@@ -1502,12 +1562,11 @@ function VFXEditor.Create(plugin: Plugin)
 		playhead.Position = UDim2.new(alpha, -1, 0, 0)
 	end
 
-	--one third of the window each, laid out left to right
-	local function buildPane(titleText: string, order: number, width: number)
+	--A titled, scrolling column filling the room below the timeline.
+	local function buildPane(titleText: string)
 		local pane = Instance.new("Frame")
 		pane.Name = titleText:gsub("%s", "")
-		pane.LayoutOrder = order
-		pane.Size = UDim2.fromScale(width, 1)
+		pane.Size = UDim2.fromScale(1, 1)
 		pane.BorderSizePixel = 0
 		pane.BackgroundColor3 = theme.background
 		pane.Parent = paneHolder
@@ -1547,32 +1606,18 @@ function VFXEditor.Create(plugin: Plugin)
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
 		layout.Parent = content
 
-		--right-hand divider, so the panes read as separate columns
-		local divider = Instance.new("Frame")
-		divider.Name = "Divider"
-		divider.AnchorPoint = Vector2.new(1, 0)
-		divider.Position = UDim2.fromScale(1, 0)
-		divider.Size = UDim2.new(0, 1, 1, 0)
-		divider.BorderSizePixel = 0
-		divider.BackgroundColor3 = theme.border
-		divider.Parent = pane
-
 		return {
 			pane = pane,
 			header = header,
 			title = title,
 			content = content,
-			divider = divider,
 		}
 	end
 
-	--There is no emitter column: the timeline's rows are the list of emitters, and
-	--picking one there is what the middle pane used to be for. The sequence list
-	--holds nothing but names, so the parameters take the rest of the width.
-	local sequencePane = buildPane("VFX Sequences", 1, 1 / 3)
-	local parameterPane = buildPane("Parameters", 2, 2 / 3)
-	--nothing sits to the right of the last pane
-	parameterPane.divider.Visible = false
+	--One pane, holding the whole width. The other two are gone: the timeline's rows
+	--are the list of emitters, and the band above names the effect, so neither a
+	--column of emitters nor a column of effects has anything left to say.
+	local parameterPane = buildPane("Parameters")
 
 	local function clearPane(pane)
 		for _, child in pane.content:GetChildren() do
@@ -1603,65 +1648,6 @@ function VFXEditor.Create(plugin: Plugin)
 		padding.Parent = label
 
 		return label
-	end
-
-	--a selectable list entry: primary name on the left, dimmed detail on the right
-	local function addSelectableRow(pane, order: number, primary: string, secondary: string, selected: boolean, onClick)
-		local button = Instance.new("TextButton")
-		button.Name = "Row"
-		button.LayoutOrder = order
-		button.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
-		button.BorderSizePixel = 0
-		button.AutoButtonColor = false
-		button.BackgroundColor3 = selected and theme.rowSelected or theme.background
-		button.BackgroundTransparency = selected and 0 or 1
-		button.Text = ""
-		button.Parent = pane.content
-
-		local padding = Instance.new("UIPadding")
-		padding.PaddingLeft = UDim.new(0, PADDING)
-		padding.PaddingRight = UDim.new(0, PADDING)
-		padding.Parent = button
-
-		local nameLabel = Instance.new("TextLabel")
-		nameLabel.Name = "Name"
-		nameLabel.Size = UDim2.fromScale(0.65, 1)
-		nameLabel.BackgroundTransparency = 1
-		nameLabel.Font = Enum.Font.SourceSans
-		nameLabel.TextSize = TEXT_SIZE
-		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-		nameLabel.TextColor3 = selected and theme.selectedText or theme.text
-		nameLabel.Text = primary
-		nameLabel.Parent = button
-
-		local detailLabel = Instance.new("TextLabel")
-		detailLabel.Name = "Detail"
-		detailLabel.AnchorPoint = Vector2.new(1, 0)
-		detailLabel.Position = UDim2.fromScale(1, 0)
-		detailLabel.Size = UDim2.fromScale(0.35, 1)
-		detailLabel.BackgroundTransparency = 1
-		detailLabel.Font = Enum.Font.SourceSans
-		detailLabel.TextSize = TEXT_SIZE
-		detailLabel.TextXAlignment = Enum.TextXAlignment.Right
-		detailLabel.TextTruncate = Enum.TextTruncate.AtEnd
-		detailLabel.TextColor3 = theme.dimText
-		detailLabel.Text = secondary
-		detailLabel.Parent = button
-
-		if not selected then
-			button.MouseEnter:Connect(function()
-				button.BackgroundTransparency = 0
-				button.BackgroundColor3 = theme.rowHover
-			end)
-			button.MouseLeave:Connect(function()
-				button.BackgroundTransparency = 1
-			end)
-		end
-
-		button.Activated:Connect(onClick)
-
-		return button
 	end
 
 	--A list floated over the window, on a backdrop that dismisses it when
@@ -1785,7 +1771,9 @@ function VFXEditor.Create(plugin: Plugin)
 		return box
 	end
 
-	local function makeValueButton(text: string, asField: boolean?): TextButton
+	--`insetLeft` leaves room at the button's left-hand end for something drawn
+	--over it, which is how a colour row fits its swatch in front of its text.
+	local function makeValueButton(text: string, asField: boolean?, insetLeft: number?): TextButton
 		local button = Instance.new("TextButton")
 		button.Position = UDim2.fromOffset(0, 2)
 		button.Size = UDim2.new(1, 0, 0, ROW_HEIGHT - 4)
@@ -1799,7 +1787,7 @@ function VFXEditor.Create(plugin: Plugin)
 		button.Text = text
 
 		local padding = Instance.new("UIPadding")
-		padding.PaddingLeft = UDim.new(0, 4)
+		padding.PaddingLeft = UDim.new(0, insetLeft or 4)
 		padding.PaddingRight = UDim.new(0, 4)
 		padding.Parent = button
 
@@ -1845,6 +1833,38 @@ function VFXEditor.Create(plugin: Plugin)
 		button.Activated:Connect(function()
 			SequenceEditor.Open(plugin, title, kind, value, commit)
 		end)
+	end
+
+	--A colour is chosen rather than typed, so the row carries the colour itself
+	--and opens a picker: the same window the colour sequences use, with the
+	--keypoints taken away. The numbers stay on the row beside the swatch, since
+	--a tint of 128, 128, 128 is worth being able to read off at a glance and no
+	--swatch says that on its own.
+	local function fillColorEditor(container: Frame, value: Color3, commit: (any) -> (), title: string)
+		local function open()
+			SequenceEditor.Open(plugin, title, "color", value, commit)
+		end
+
+		local button = makeValueButton(Fields.ToText(value), true, SWATCH_SIZE + SWATCH_INSET * 2 + 4)
+		button.Parent = container
+		button.Activated:Connect(open)
+
+		--Laid over the field rather than put inside it: the field's own padding is
+		--what holds the text clear of the swatch, and a child of the field would
+		--be held clear by it too. A button rather than a frame so that the colour
+		--itself is the thing you click, which is where the eye goes.
+		local swatch = Instance.new("TextButton")
+		swatch.Name = "Swatch"
+		swatch.AnchorPoint = Vector2.new(0, 0.5)
+		swatch.Position = UDim2.fromOffset(SWATCH_INSET, 2 + (ROW_HEIGHT - 4) // 2)
+		swatch.Size = UDim2.fromOffset(SWATCH_SIZE, SWATCH_SIZE)
+		swatch.BackgroundColor3 = value
+		swatch.BorderColor3 = theme.inputBorder
+		swatch.AutoButtonColor = false
+		swatch.Text = ""
+		swatch.ZIndex = 2
+		swatch.Parent = container
+		swatch.Activated:Connect(open)
 	end
 
 	local function fillBooleanEditor(container: Frame, value: boolean, commit: (any) -> ())
@@ -1990,6 +2010,10 @@ function VFXEditor.Create(plugin: Plugin)
 
 		if valueType == "NumberSequence" or valueType == "ColorSequence" then
 			fillSequenceEditor(container, value, commit, title or "Sequence")
+		elseif valueType == "Color3" then
+			--ahead of the text field a colour would otherwise land in: a colour
+			--can be typed, but choosing one by eye is the whole point of it
+			fillColorEditor(container, value, commit, title or "Color")
 		elseif Fields.IsTextEditable(value) then
 			fillTextEditor(container, value, commit)
 		elseif valueType == "boolean" then
@@ -2133,7 +2157,7 @@ function VFXEditor.Create(plugin: Plugin)
 		row.BorderSizePixel = 0
 	end
 
-	local refreshSequences, refreshParameters, watchSelection
+	local refreshParameters, watchSelection
 
 	local function disconnectEmitterConnections()
 		for _, connection in emitterConnections do
@@ -2180,9 +2204,9 @@ function VFXEditor.Create(plugin: Plugin)
 		end)
 	end
 
-	--Not one emitter's values but which emitters there are: a rebuild of the
-	--middle pane and of the rows, and a rewiring of the watchers so that an
-	--emitter just added is followed like the rest.
+	--Not one emitter's values but which emitters there are: a rebuild of the rows,
+	--and a rewiring of the watchers so that an emitter just added is followed like
+	--the rest.
 	local emitterSetQueued = false
 
 	local function requestEmitterSetRefresh()
@@ -2624,7 +2648,7 @@ function VFXEditor.Create(plugin: Plugin)
 		updateToolbar()
 	end
 
-	local function selectSequence(sequence: Instance?)
+	function selectSequence(sequence: Instance?)
 		selectedSequence = sequence
 		selectedEmitter = nil
 
@@ -2636,33 +2660,9 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 
 		watchSelection()
-		refreshSequences()
+		updateToolbar()
 		refreshParameters()
 		refreshTimeline()
-	end
-
-	function refreshSequences()
-		clearPane(sequencePane)
-		updateToolbar()
-
-		local sequences = CollectionService:GetTagged(VFX_SEQUENCE_TAG)
-		table.sort(sequences, function(a, b)
-			return a.Name < b.Name
-		end)
-
-		sequencePane.title.Text = string.format("VFX Sequences (%d)", #sequences)
-
-		if #sequences == 0 then
-			addLabelRow(sequencePane, 1, "Nothing tagged 'VFXSequence'.", theme.dimText, false)
-			return
-		end
-
-		for index, sequence in sequences do
-			local parentName = sequence.Parent ~= nil and sequence.Parent.Name or ""
-			addSelectableRow(sequencePane, index, sequence.Name, parentName, sequence == selectedSequence, function()
-				selectSequence(sequence)
-			end)
-		end
 	end
 
 	--drop a selection whose instance was deleted or untagged, then redraw
@@ -2682,7 +2682,7 @@ function VFXEditor.Create(plugin: Plugin)
 			watchSelection()
 		end
 
-		refreshSequences()
+		updateToolbar()
 		refreshParameters()
 		refreshTimeline()
 	end
@@ -2693,7 +2693,10 @@ function VFXEditor.Create(plugin: Plugin)
 		root.BackgroundColor3 = theme.background
 		toolbar.BackgroundColor3 = theme.header
 		toolbarDivider.BackgroundColor3 = theme.border
-		playTarget.TextColor3 = theme.dimText
+
+		selectorBand.BackgroundColor3 = theme.header
+		sequenceButton.BackgroundColor3 = theme.inputBackground
+		sequenceButton.BorderColor3 = theme.inputBorder
 
 		tooltip.BackgroundColor3 = theme.inputBackground
 		tooltip.BorderColor3 = theme.border
@@ -2719,14 +2722,12 @@ function VFXEditor.Create(plugin: Plugin)
 			button.BorderColor3 = theme.buttonBorder
 		end
 
-		for _, pane in { sequencePane, parameterPane } do
-			pane.pane.BackgroundColor3 = theme.background
-			pane.header.BackgroundColor3 = theme.header
-			pane.title.TextColor3 = theme.text
-			pane.divider.BackgroundColor3 = theme.border
-		end
+		parameterPane.pane.BackgroundColor3 = theme.background
+		parameterPane.header.BackgroundColor3 = theme.header
+		parameterPane.title.TextColor3 = theme.text
 
-		--rows carry theme colours baked in at creation, so redraw them
+		--rows carry theme colours baked in at creation, so redraw them, and the
+		--picker's own text is coloured by whether anything is picked
 		refreshAll()
 	end
 
@@ -2808,7 +2809,7 @@ function VFXEditor.Create(plugin: Plugin)
 
 	--The playback buttons live in the window but the engine that drives a
 	--sequence does not, so the caller says what they do. Play is handed the
-	--sequence picked in the left pane, and is inert until one is picked.
+	--sequence named in the picker, and is inert until one is chosen.
 	function controller:OnPlay(callback)
 		table.insert(playCallbacks, callback)
 	end

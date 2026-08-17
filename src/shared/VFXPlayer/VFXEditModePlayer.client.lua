@@ -3,7 +3,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 game:GetService("StarterPlayer")
 
 --Play and Stop are buttons in the VFX Editor window rather than on the ribbon,
---so that playback follows the sequence picked in the window's left pane. The
+--so that playback follows the sequence chosen in the window's own picker. The
 --ribbon is left with the one button that opens that window.
 local editorButton = toolbar:CreateButton("VFX Editor", "Inspect the VFX Sequences in this place", "rbxasset://studio_svg_textures/Shared/InsertableObjects/Dark/Standard/ParticleEmitter.png")
 
