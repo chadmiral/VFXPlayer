@@ -127,6 +127,10 @@ task.spawn(function()
         local deltaTime = task.wait()
         pluginTime = pluginTime + deltaTime
 
+        --the effect whose progress the editor's timeline cursor follows
+        local playingModel = nil
+        local playingElapsed = nil
+
         local timeStamp = pluginTime
         local i = 1
         while i <= #activeSequences do
@@ -146,8 +150,14 @@ task.spawn(function()
                 end
             else
                 s:Update(elapsedTime)
+                if playingModel == nil then
+                    playingModel = s.model
+                    playingElapsed = elapsedTime
+                end
                 i += 1
             end
         end
+
+        editor:SetPlayhead(playingModel, playingElapsed)
     end
 end)

@@ -6,11 +6,18 @@ local VFXEditor = {}
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Selection = game:GetService("Selection")
+local TextService = game:GetService("TextService")
+local UserInputService = game:GetService("UserInputService")
 local Studio = settings().Studio
 
 local Fields = require(script.Parent:WaitForChild("VFXEditorFields"))
 local SequenceEditor = require(script.Parent:WaitForChild("VFXSequenceEditor"))
+
+--the runtime's own timeline builder, so the bar the editor draws is sequenced by
+--the same code that plays it
+local Utility = require(ReplicatedStorage.Client.Systems.VFXPlayerClient.Utility)
 
 local VFX_SEQUENCE_TAG = "VFXSequence"
 local MESH_EMITTER_TAG = "MeshEmitter"
@@ -21,12 +28,121 @@ local TEXT_SIZE = 14
 local PADDING = 8
 --the playback band above the panes, and the size of a button in it
 local TOOLBAR_HEIGHT = 32
-local BUTTON_WIDTH = 96
+--the buttons are square and carry nothing but their icon, with what each one does
+--in a tooltip rather than on its face
+local BUTTON_SIZE = 22
 local ICON_SIZE = 16
+--how long the mouse has to rest on a button before its tooltip appears, so that
+--sweeping across the toolbar does not flash every one of them in turn
+local TOOLTIP_DELAY = 0.4
+local TOOLTIP_PADDING = 6
+--The stage timeline below the buttons: one row per emitter, stacked on a shared
+--time axis. The band grows with the emitter count up to MAX_ROWS and then
+--scrolls, so a sequence with three emitters does not reserve room for thirty.
+local TIMELINE_ROW_HEIGHT = 20
+local TIMELINE_TRACK_HEIGHT = 14
+local TIMELINE_NAME_WIDTH = 118
+local TIMELINE_AXIS_HEIGHT = 16
+local TIMELINE_MAX_ROWS = 10
+local TIMELINE_SCROLLBAR = 6
+--the room the three panes are always left with, which is what decides how many
+--rows the band may take for itself
+local TIMELINE_MIN_PANES = 140
+--Where a row's bar starts and stops, which the lines drawn across every row
+--share. The rows always reserve the scroll bar so this column is the same width
+--whether the bar is showing or not, and the lines cannot drift out of step.
+local TIMELINE_TRACK_LEFT = PADDING + TIMELINE_NAME_WIDTH
+local TIMELINE_TRACK_RIGHT = PADDING + TIMELINE_SCROLLBAR
+--How near a stage border counts as being on it, and the white line drawn over the
+--border while the mouse is that near or is dragging it.
+local BORDER_GRAB = 5
+local BORDER_HIGHLIGHT_WIDTH = 3
+--How soon after a click on an emitter's name a second one counts as a double
+--click, which is what opens that name for editing.
+local DOUBLE_CLICK_TIME = 0.4
+--What a dragged length snaps to, so that a drag lands on a round number rather
+--than on whatever pixel the mouse happened to be over.
+local DRAG_SNAP = 0.1
+--The shortest a stage can be dragged, which is one snap step: the step below it is
+--nothing at all, and a stage of no length disappears from the timeline along with
+--the border that would drag it back. Zeroing a stage out is what the parameters
+--pane is for.
+local MIN_DRAG_DURATION = DRAG_SNAP
 
 --the icons these two buttons carried when they lived on the Studio ribbon
 local PLAY_ICON = "rbxassetid://8215093320"
 local STOP_ICON = "rbxassetid://579151508"
+
+--Studio's own ribbon artwork for adding and deleting: a plus and a waste basket.
+--It ships one copy of each per theme, so the name of the theme goes in the %s.
+local ADD_ICON = "rbxasset://studio_svg_textures/Shared/Ribbon/%s/Standard/RibbonAddNoBorderSmall.png"
+local DELETE_ICON = "rbxasset://studio_svg_textures/Shared/Ribbon/%s/Standard/RibbonDeleteSmall.png"
+
+--What Add Emitter offers: what the menu calls each one, the class it creates, and
+--for the mesh emitter the tag the runtime knows it by, since that is an ordinary
+--Attachment until it is tagged.
+--`attachTo` is what the class needs above it to render at all: an emitter or a
+--light will hang off either a part or an attachment and prefers an attachment,
+--while an attachment itself can only go on a part.
+local NEW_EMITTER_KINDS = {
+	{ text = "Particle Emitter", className = "ParticleEmitter", attachTo = "Attachment" },
+	{ text = "Mesh Emitter", className = "Attachment", tag = MESH_EMITTER_TAG, attachTo = "BasePart" },
+	{ text = "Light", className = "PointLight", attachTo = "Attachment" },
+}
+
+--A fill per stage, and red for the delays between them. Fixed rather than drawn
+--from the theme, since the point is to tell the four apart at a glance.
+local STAGE_COLORS = {
+	stand = Color3.fromRGB(74, 134, 204),
+	hold = Color3.fromRGB(78, 158, 96),
+	decay = Color3.fromRGB(198, 142, 60),
+}
+local DELAY_COLOR = Color3.fromRGB(188, 66, 66)
+
+--the three animation stages, in playback order
+local STAGES = { "Stand", "Hold", "Decay" }
+
+--Snap a dragged length, then clear the floating point drift that multiplying the
+--step count back out leaves behind, so that the number the parameters pane goes
+--on to show is exactly the one an author would have typed themselves.
+local function snapSeconds(value: number): number
+	local snapped = math.floor(value / DRAG_SNAP + 0.5) * DRAG_SNAP
+	return math.floor(snapped * 1000 + 0.5) / 1000
+end
+
+--The length given to an effect that names none, so that one loaded in the editor
+--always has something to divide into stages and something to play for.
+local DEFAULT_SEQUENCE_DURATION = 1
+
+--Stage timings for one instance in playback order, shaped for
+--Utility.BuildTimeline. `sequenceDuration` is what a Stand stage spans when it
+--names no duration of its own.
+--
+--These attribute names mirror the runtime's own reader in Sequence.lua, and are
+--read here rather than borrowed from it on purpose: this window is a plugin
+--while that module belongs to the place, and Studio keeps the result of a module
+--it has already required for the rest of the session. A function newly added
+--over there is therefore absent from the copy a running session hands back,
+--however many times the plugin itself reloads.
+local function readStageTimings(inst: Instance, sequenceDuration: number)
+	local stages = {}
+
+	for _, stage in STAGES do
+		local duration = inst:GetAttribute(stage .. "Duration")
+		if duration == nil and stage == "Stand" then
+			duration = sequenceDuration
+		end
+
+		table.insert(stages, {
+			name = string.lower(stage),
+			delay = inst:GetAttribute(stage .. "Delay") or 0,
+			duration = duration or 0,
+			loopCount = if stage == "Hold" then (inst:GetAttribute("HoldLoopCount") or 1) else 1,
+		})
+	end
+
+	return stages
+end
 --how much of a parameter row the name takes, leaving the rest to the editor
 local NAME_COLUMN = 0.45
 
@@ -93,6 +209,64 @@ local function collectEmitters(sequence)
 	return emitters
 end
 
+--Somewhere inside `sequence` that a new emitter of `kind` can live. A sequence's
+--root is a Model, and none of the three classes renders parented straight to one,
+--so an emitter has to join whatever the effect already hangs its others off. The
+--first suitable host in the hierarchy is taken; an attachment is preferred over a
+--part where either would do, since that is where the emitters in these effects
+--already sit. Returns nil for an effect with nothing suitable in it at all.
+local function findEmitterHost(sequence: Instance, kind): Instance?
+	local part = nil
+
+	for _, d in sequence:GetDescendants() do
+		--an attachment that is itself a mesh emitter is skipped: it is one of the
+		--things being animated rather than somewhere to put another
+		if kind.attachTo == "Attachment" and d:IsA("Attachment") and not isMeshEmitter(d) then
+			return d
+		elseif d:IsA("BasePart") then
+			if kind.attachTo ~= "Attachment" then
+				return d
+			end
+			part = part or d
+		end
+	end
+
+	return part
+end
+
+--The host convention these effects already follow, for the one case where there
+--is nothing to reuse: an anchored, invisible, collisionless part at the effect's
+--own position, with an attachment inside it.
+local function makeEmitterHost(sequence: Instance, kind): Instance
+	local part = Instance.new("Part")
+	part.Name = "EmitterPart"
+	part.Size = Vector3.new(0.2, 0.2, 0.2)
+	part.Transparency = 1
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+
+	--so that a new emitter starts where the effect is rather than at the origin
+	if sequence:IsA("PVInstance") then
+		part.CFrame = sequence:GetPivot()
+	end
+
+	part.Parent = sequence
+
+	if kind.attachTo ~= "Attachment" then
+		return part
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "EmitterAttachment"
+	attachment.Parent = part
+	return attachment
+end
+
 --A "Base<Property>" attribute holds the authored value the runtime animates the
 --matching native property away from and back to, so to an author the two are
 --one parameter and the attribute is the half worth editing. Returns the
@@ -135,6 +309,62 @@ local function recorded(name: string, edit: () -> ()): boolean
 	return ok
 end
 
+--Author every stage timing the emitters of `sequence` are missing, so an effect
+--loaded in the editor carries a full set to read and edit rather than leaving the
+--runtime to fall back on values that are nowhere written down. A missing duration
+--takes an even third of the sequence's own, and a missing delay is zero, so the
+--three stages run back to back and fill the sequence exactly.
+--
+--Nothing is recorded when nothing is missing, so clicking through sequences does
+--not litter the undo history with empty waypoints.
+local function ensureStageAttributes(sequence: Instance)
+	local writes = {}
+
+	local function want(inst: Instance, name: string, value: any)
+		if inst:GetAttribute(name) == nil then
+			table.insert(writes, { instance = inst, name = name, value = value })
+		end
+	end
+
+	--The effect's own length, which everything below is derived from. An absent
+	--one is a fault rather than a choice: the runtime compares elapsed time
+	--against it directly, so a sequence without one cannot play at all.
+	local duration = sequence:GetAttribute("Duration")
+	if duration == nil then
+		duration = DEFAULT_SEQUENCE_DURATION
+		want(sequence, "Duration", duration)
+	end
+
+	want(sequence, "Looping", false)
+
+	--A length that is present but unusable is left exactly as authored rather than
+	--overwritten, which leaves nothing to divide into stages.
+	if typeof(duration) == "number" and duration > 0 then
+		local share = duration / #STAGES
+
+		for _, emitter in collectEmitters(sequence) do
+			for _, stage in STAGES do
+				want(emitter, stage .. "Delay", 0)
+				want(emitter, stage .. "Duration", share)
+			end
+
+			--not a timing, but how many times the hold window repeats; writing the
+			--value it already falls back to changes nothing beyond making it editable
+			want(emitter, "HoldLoopCount", 1)
+		end
+	end
+
+	if #writes == 0 then
+		return
+	end
+
+	recorded("Add missing VFX attributes to " .. sequence.Name, function()
+		for _, write in writes do
+			write.instance:SetAttribute(write.name, write.value)
+		end
+	end)
+end
+
 local function currentTheme()
 	local theme = Studio.Theme
 	return {
@@ -155,6 +385,15 @@ local function currentTheme()
 	}
 end
 
+--Which copy of a two-tone Studio icon to use. The wrong one is artwork very
+--nearly the colour of the button behind it, so it is picked by how dark the theme
+--actually is rather than by what it happens to be called.
+local function iconVariant(theme): string
+	local fill = theme.buttonBackground
+	local luminance = fill.R * 0.299 + fill.G * 0.587 + fill.B * 0.114
+	return if luminance < 0.5 then "Dark" else "Light"
+end
+
 --Build the editor window and wire it to `plugin`. Returns a controller with
 --Toggle/IsOpen/SetOpen/Destroy plus an OpenChanged signal-ish callback hook so
 --the caller can keep its toolbar button's active state in sync.
@@ -166,7 +405,8 @@ function VFXEditor.Create(plugin: Plugin)
 		900, -- default width
 		480, -- default height
 		520, -- minimum width
-		260 -- minimum height
+		--enough that the playback and timeline bands still leave the panes usable
+		320 -- minimum height
 	)
 
 	local widget = plugin:CreateDockWidgetPluginGui("VFXEditor", widgetInfo)
@@ -178,6 +418,13 @@ function VFXEditor.Create(plugin: Plugin)
 
 	local selectedSequence: Instance? = nil
 	local selectedEmitter: Instance? = nil
+
+	--Picking an emitter redraws the panes and the timeline, all of which are built
+	--below, but the toolbar and the timeline rows above both need to ask for it, so
+	--it is named here and defined down there. The same goes for the picker list,
+	--which the parameter rows and the Add Emitter button both raise.
+	local selectEmitter
+	local openDropdown
 
 	--the open picker list, if any, and whether a field is mid-edit
 	local dropdown: GuiObject? = nil
@@ -222,36 +469,81 @@ function VFXEditor.Create(plugin: Plugin)
 
 	local toolbarDivider = Instance.new("Frame")
 	toolbarDivider.Name = "PlaybackDivider"
+	--the timeline band sits between this and the buttons, and it is the one that
+	--knows how tall it needs to be, so it places this line and the panes below it
 	toolbarDivider.Position = UDim2.fromOffset(0, TOOLBAR_HEIGHT - 1)
 	toolbarDivider.Size = UDim2.new(1, 0, 0, 1)
 	toolbarDivider.BorderSizePixel = 0
 	toolbarDivider.BackgroundColor3 = theme.border
 	toolbarDivider.Parent = root
 
-	--Icon beside label, both centred, the way the same two commands read on the
-	--ribbon. The button's own Text is left empty so the pair can be centred
-	--together: a button's text always centres on the whole button, which with an
-	--icon in the way would sit off to one side of it.
+	--Roblox gives a plugin window no tooltips of its own, so the toolbar draws its
+	--own: one label floated over the window, since only one button can be under the
+	--mouse at a time. It hangs below the toolbar, so it is a child of the root and
+	--not of the band -- and the root deliberately carries no layout that would
+	--otherwise arrange it into a column of its own.
+	local tooltip = Instance.new("TextLabel")
+	tooltip.Name = "Tooltip"
+	tooltip.BackgroundColor3 = theme.inputBackground
+	tooltip.BorderColor3 = theme.border
+	tooltip.Font = Enum.Font.SourceSans
+	tooltip.TextSize = TEXT_SIZE
+	tooltip.TextColor3 = theme.text
+	tooltip.ZIndex = 20
+	tooltip.Visible = false
+	tooltip.Text = ""
+	tooltip.Parent = root
+
+	--Bumped on every show and hide, so that a tooltip still waiting out its delay
+	--knows the mouse has moved on and drops itself instead of appearing.
+	local tooltipToken = 0
+
+	local function hideTooltip()
+		tooltipToken += 1
+		tooltip.Visible = false
+	end
+
+	local function showTooltip(anchor: GuiObject, text: string)
+		tooltipToken += 1
+		local token = tooltipToken
+
+		task.delay(TOOLTIP_DELAY, function()
+			if token ~= tooltipToken or not widget.Enabled then
+				return
+			end
+
+			--Measured rather than grown into place, so it can be centred under the
+			--button it belongs to and kept inside the window in one go.
+			local text_size = TextService:GetTextSize(text, TEXT_SIZE, Enum.Font.SourceSans, Vector2.new(1000, 100))
+			local width = text_size.X + TOOLTIP_PADDING * 2
+			local origin = anchor.AbsolutePosition - root.AbsolutePosition
+			local x = origin.X + anchor.AbsoluteSize.X / 2 - width / 2
+			local room = math.max(PADDING, root.AbsoluteSize.X - width - PADDING)
+
+			tooltip.Text = text
+			tooltip.Size = UDim2.fromOffset(width, ROW_HEIGHT)
+			tooltip.Position =
+				UDim2.fromOffset(math.floor(math.clamp(x, PADDING, room)), origin.Y + anchor.AbsoluteSize.Y + 3)
+			tooltip.Visible = true
+		end)
+	end
+
+	--A square button holding nothing but its icon. What it does is named in the
+	--tooltip, which is the only place it is written now.
 	local function makeToolbarButton(text: string, order: number, icon: string)
 		local button = Instance.new("TextButton")
 		button.Name = (text:gsub("%s", ""))
 		button.LayoutOrder = order
-		button.Size = UDim2.fromOffset(BUTTON_WIDTH, ROW_HEIGHT)
+		button.Size = UDim2.fromOffset(BUTTON_SIZE, BUTTON_SIZE)
 		button.BackgroundColor3 = theme.buttonBackground
 		button.BorderColor3 = theme.buttonBorder
 		button.Text = ""
 		button.Parent = toolbar
 
-		local layout = Instance.new("UIListLayout")
-		layout.FillDirection = Enum.FillDirection.Horizontal
-		layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-		layout.VerticalAlignment = Enum.VerticalAlignment.Center
-		layout.Padding = UDim.new(0, 4)
-		layout.Parent = button
-
 		local image = Instance.new("ImageLabel")
 		image.Name = "Icon"
-		image.LayoutOrder = 1
+		image.AnchorPoint = Vector2.new(0.5, 0.5)
+		image.Position = UDim2.fromScale(0.5, 0.5)
 		image.Size = UDim2.fromOffset(ICON_SIZE, ICON_SIZE)
 		image.BackgroundTransparency = 1
 		image.Image = icon
@@ -260,29 +552,28 @@ function VFXEditor.Create(plugin: Plugin)
 		image.ScaleType = Enum.ScaleType.Fit
 		image.Parent = button
 
-		local label = Instance.new("TextLabel")
-		label.Name = "Label"
-		label.LayoutOrder = 2
-		label.AutomaticSize = Enum.AutomaticSize.X
-		label.Size = UDim2.fromOffset(0, ROW_HEIGHT)
-		label.BackgroundTransparency = 1
-		label.Font = Enum.Font.SourceSans
-		label.TextSize = TEXT_SIZE
-		label.TextColor3 = theme.buttonText
-		label.Text = text
-		label.Parent = button
+		button.MouseEnter:Connect(function()
+			showTooltip(button, text)
+		end)
+		button.MouseLeave:Connect(hideTooltip)
+		--a tooltip left hanging over the menu a button just opened
+		button.Activated:Connect(hideTooltip)
 
-		return button, image, label
+		return button, image
 	end
 
-	local playButton, playIcon, playLabel = makeToolbarButton("Play VFX", 1, PLAY_ICON)
-	local stopButton, _, stopLabel = makeToolbarButton("Stop All", 2, STOP_ICON)
+	local playButton, playIcon = makeToolbarButton("Play VFX", 1, PLAY_ICON)
+	local stopButton = makeToolbarButton("Stop All", 2, STOP_ICON)
+
+	local variant = iconVariant(theme)
+	local addButton, addIcon = makeToolbarButton("Add Emitter", 3, string.format(ADD_ICON, variant))
+	local deleteButton, deleteIcon = makeToolbarButton("Delete Emitter", 4, string.format(DELETE_ICON, variant))
 
 	--Play acts on the pane's selection rather than the hierarchy's, which is not
 	--something a button can show on its own, so the target is named beside it.
 	local playTarget = Instance.new("TextLabel")
 	playTarget.Name = "PlayTarget"
-	playTarget.LayoutOrder = 3
+	playTarget.LayoutOrder = 5
 	playTarget.AutomaticSize = Enum.AutomaticSize.X
 	playTarget.Size = UDim2.fromOffset(0, ROW_HEIGHT)
 	playTarget.BackgroundTransparency = 1
@@ -315,14 +606,85 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 	end)
 
+	--A fresh emitter of the chosen kind, carrying nothing but its class defaults and
+	--joining whatever the effect already hangs its emitters off. The host, the
+	--emitter and its stage timings are all authored in one recording, so adding one
+	--is a single thing to undo rather than three: a recording started inside another
+	--simply joins it.
+	local function addEmitter(kind)
+		local sequence = selectedSequence
+		if sequence == nil or sequence.Parent == nil then
+			return
+		end
+
+		local added = nil
+		local ok = recorded(string.format("Add %s to %s", kind.text, sequence.Name), function()
+			local host = findEmitterHost(sequence, kind) or makeEmitterHost(sequence, kind)
+
+			added = Instance.new(kind.className)
+			--tagged before it is parented, so that it already counts as an emitter by
+			--the time anything watching the sequence hears about it
+			if kind.tag ~= nil then
+				CollectionService:AddTag(added, kind.tag)
+			end
+			added.Parent = host
+			ensureStageAttributes(sequence)
+		end)
+
+		if ok and added ~= nil then
+			selectEmitter(added)
+		end
+	end
+
+	--Which kind to add is asked rather than assumed, since the runtime animates
+	--three different sorts of emitter and they are not interchangeable.
+	addButton.Activated:Connect(function()
+		local items = {}
+		for _, kind in NEW_EMITTER_KINDS do
+			table.insert(items, {
+				text = kind.text,
+				activate = function()
+					addEmitter(kind)
+				end,
+			})
+		end
+
+		openDropdown(addButton, items)
+	end)
+
+	--Parented away rather than destroyed: a destroyed instance is locked, and an
+	--undo cannot bring it back.
+	deleteButton.Activated:Connect(function()
+		local emitter = selectedEmitter
+		if emitter == nil or emitter.Parent == nil then
+			return
+		end
+
+		local ok = recorded("Delete " .. emitter.Name, function()
+			emitter.Parent = nil
+		end)
+
+		if ok then
+			selectEmitter(nil)
+		end
+	end)
+
+	--A button that cannot act says so: its icon fades and it stops lighting up
+	--under the mouse.
+	local function setButtonEnabled(button: TextButton, icon: ImageLabel, enabled: boolean)
+		button.Active = enabled
+		button.AutoButtonColor = enabled
+		icon.ImageTransparency = if enabled then 0 else 0.6
+	end
+
 	local function updateToolbar()
 		local sequence = selectedSequence
-		local playable = sequence ~= nil
+		local haveSequence = sequence ~= nil and sequence.Parent ~= nil
 
-		playButton.Active = playable
-		playButton.AutoButtonColor = playable
-		playLabel.TextColor3 = if playable then theme.buttonText else theme.dimText
-		playIcon.ImageTransparency = if playable then 0 else 0.6
+		setButtonEnabled(playButton, playIcon, sequence ~= nil)
+		setButtonEnabled(addButton, addIcon, haveSequence)
+		setButtonEnabled(deleteButton, deleteIcon, selectedEmitter ~= nil)
+
 		playTarget.Text = if sequence ~= nil then sequence.Name else "Select a sequence to play."
 	end
 
@@ -333,8 +695,6 @@ function VFXEditor.Create(plugin: Plugin)
 	--top of the layout instead of in it.
 	local paneHolder = Instance.new("Frame")
 	paneHolder.Name = "Panes"
-	paneHolder.Position = UDim2.fromOffset(0, TOOLBAR_HEIGHT)
-	paneHolder.Size = UDim2.new(1, 0, 1, -TOOLBAR_HEIGHT)
 	paneHolder.BackgroundTransparency = 1
 	paneHolder.BorderSizePixel = 0
 	paneHolder.Parent = root
@@ -344,12 +704,649 @@ function VFXEditor.Create(plugin: Plugin)
 	paneLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	paneLayout.Parent = paneHolder
 
+	--The stage timeline. One row per emitter in the selected sequence, each
+	--showing stand, hold and decay laid end to end with their delays between
+	--them. Every row shares one time axis, so the rows can be read against each
+	--other and a single line marks where playback has reached across all of them.
+	local timelineBand = Instance.new("Frame")
+	timelineBand.Name = "Timeline"
+	timelineBand.Position = UDim2.fromOffset(0, TOOLBAR_HEIGHT)
+	timelineBand.BorderSizePixel = 0
+	timelineBand.BackgroundColor3 = theme.header
+	timelineBand.Parent = root
+
+	local rows = Instance.new("ScrollingFrame")
+	rows.Name = "Rows"
+	rows.Position = UDim2.fromOffset(0, 2)
+	rows.BackgroundTransparency = 1
+	rows.BorderSizePixel = 0
+	rows.ScrollBarThickness = TIMELINE_SCROLLBAR
+	rows.ScrollingDirection = Enum.ScrollingDirection.Y
+	--always inset, so a row's bar is the same width whether the bar is showing or
+	--not and the lines drawn over the rows stay aligned with it
+	rows.VerticalScrollBarInset = Enum.ScrollBarInset.Always
+	rows.CanvasSize = UDim2.new()
+	rows.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	rows.Parent = timelineBand
+
+	local rowLayout = Instance.new("UIListLayout")
+	rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	rowLayout.Parent = rows
+
+	--The two vertical lines are drawn across the rows rather than inside them, so
+	--each is one continuous line down the whole stack. They live beside the
+	--scrolling rows and share the bars' column, which is why that column reserves
+	--the scroll bar whether or not it is showing.
+	local overlay = Instance.new("Frame")
+	overlay.Name = "Lines"
+	overlay.Position = UDim2.fromOffset(TIMELINE_TRACK_LEFT, 2)
+	overlay.Size = UDim2.new(1, -(TIMELINE_TRACK_LEFT + TIMELINE_TRACK_RIGHT), 1, -(2 + TIMELINE_AXIS_HEIGHT))
+	overlay.BackgroundTransparency = 1
+	overlay.BorderSizePixel = 0
+	overlay.ClipsDescendants = true
+	overlay.ZIndex = 4
+	overlay.Parent = timelineBand
+
+	--Where the sequence itself ends, which is not always where the stages do: a
+	--stage can be authored to run past the sequence's Duration, and playback stops
+	--at the Duration regardless. Only shown when the two differ.
+	local durationMark = Instance.new("Frame")
+	durationMark.Name = "DurationMark"
+	durationMark.Size = UDim2.new(0, 1, 1, 0)
+	durationMark.BorderSizePixel = 0
+	durationMark.BackgroundColor3 = theme.text
+	durationMark.BackgroundTransparency = 0.45
+	durationMark.Visible = false
+	durationMark.Parent = overlay
+
+	--The only thing playback touches.
+	local playhead = Instance.new("Frame")
+	playhead.Name = "Playhead"
+	playhead.Size = UDim2.new(0, 2, 1, 0)
+	playhead.BorderSizePixel = 0
+	playhead.BackgroundColor3 = theme.text
+	playhead.ZIndex = 2
+	playhead.Visible = false
+	playhead.Parent = overlay
+
+	--stands in for the rows when there is nothing to lay out
+	local timelineHint = Instance.new("TextLabel")
+	timelineHint.Name = "Hint"
+	timelineHint.Position = UDim2.fromOffset(PADDING, 2)
+	timelineHint.Size = UDim2.new(1, -PADDING * 2, 0, TIMELINE_ROW_HEIGHT)
+	timelineHint.BackgroundTransparency = 1
+	timelineHint.Font = Enum.Font.SourceSans
+	timelineHint.TextSize = TEXT_SIZE
+	timelineHint.TextXAlignment = Enum.TextXAlignment.Left
+	timelineHint.TextTruncate = Enum.TextTruncate.AtEnd
+	timelineHint.TextColor3 = theme.dimText
+	timelineHint.Text = ""
+	timelineHint.Parent = timelineBand
+
+	--The shared axis, labelled once under the stack rather than per row.
+	local function makeTimeLabel(alignment: Enum.TextXAlignment): TextLabel
+		local label = Instance.new("TextLabel")
+		label.AnchorPoint = Vector2.new(0, 1)
+		label.Position = UDim2.fromScale(0, 1)
+		label.Size = UDim2.new(0.5, -PADDING, 0, TIMELINE_AXIS_HEIGHT)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.SourceSans
+		label.TextSize = 12
+		label.TextXAlignment = alignment
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+		label.TextColor3 = theme.dimText
+		label.Text = ""
+		label.Parent = timelineBand
+		return label
+	end
+
+	local startLabel = makeTimeLabel(Enum.TextXAlignment.Left)
+	startLabel.Name = "StartTime"
+	startLabel.Position = UDim2.new(0, TIMELINE_TRACK_LEFT, 1, 0)
+
+	local endLabel = makeTimeLabel(Enum.TextXAlignment.Right)
+	endLabel.Name = "EndTime"
+	endLabel.AnchorPoint = Vector2.new(1, 1)
+	endLabel.Position = UDim2.new(1, -TIMELINE_TRACK_RIGHT, 1, 0)
+
+	--how many seconds a row spans, and so what a playhead position means
+	local timelineSpan = 0
+
+	--what the last refresh laid out, so a resize can re-fit the band without
+	--having to rebuild the rows in it
+	local timelineRowCount = 1
+
+	--The band is only as tall as it needs to be, and everything below it follows.
+	--It shows as many rows as will fit before it starts scrolling, since rows are
+	--there to be read against each other, but never so many that the panes below
+	--are squeezed out of the window.
+	local function setTimelineHeight(rowCount: number)
+		timelineRowCount = rowCount
+
+		local spare = root.AbsoluteSize.Y - TOOLBAR_HEIGHT - TIMELINE_AXIS_HEIGHT - TIMELINE_MIN_PANES
+		local allowed = math.clamp(spare // TIMELINE_ROW_HEIGHT, 1, TIMELINE_MAX_ROWS)
+		local visibleRows = math.clamp(rowCount, 1, allowed)
+		local height = 2 + visibleRows * TIMELINE_ROW_HEIGHT + TIMELINE_AXIS_HEIGHT
+
+		timelineBand.Size = UDim2.new(1, 0, 0, height)
+		rows.Size = UDim2.new(1, 0, 0, visibleRows * TIMELINE_ROW_HEIGHT)
+
+		local top = TOOLBAR_HEIGHT + height
+		toolbarDivider.Position = UDim2.fromOffset(0, top - 1)
+		paneHolder.Position = UDim2.fromOffset(0, top)
+		paneHolder.Size = UDim2.new(1, 0, 1, -top)
+	end
+
+	local function showTimelineHint(text: string)
+		rows.Visible = false
+		overlay.Visible = false
+		startLabel.Visible = false
+		endLabel.Visible = false
+		timelineHint.Visible = true
+		timelineHint.Text = text
+		setTimelineHeight(1)
+	end
+
+	--The stage border being dragged, if any: which attribute the block's length is
+	--written to, where that block starts, and the bar it is being dragged along.
+	local dragBoundary = nil
+
+	local function showBorderHighlight(highlight: Frame, alpha: number)
+		highlight.Position = UDim2.fromScale(math.clamp(alpha, 0, 1), 0)
+		highlight.Visible = true
+	end
+
+	--The attribute is written when the button comes up rather than on every mouse
+	--move: writing it rebuilds the rows, which would destroy the very handle being
+	--dragged, and one drag should read back as one undo entry rather than hundreds.
+	local function endBoundaryDrag()
+		local drag = dragBoundary
+		if drag == nil then
+			return
+		end
+
+		dragBoundary = nil
+		drag.highlight.Visible = false
+
+		if drag.emitter.Parent == nil then
+			return
+		end
+
+		--a press that never moved is a click on the row like any other
+		if drag.value == nil then
+			selectEmitter(drag.emitter)
+			return
+		end
+
+		local attribute = drag.blocks[drag.index].attribute
+		recorded("Set " .. attribute, function()
+			drag.emitter:SetAttribute(attribute, drag.value)
+		end)
+	end
+
+	local function endBoundaryDragOnRelease(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			endBoundaryDrag()
+		end
+	end
+
+	--Where a block and its border sit on the axis. Used to lay a row out to begin
+	--with and to move it while one of its borders is being dragged.
+	local function layoutBlock(block, from: number, to: number, span: number)
+		block.frame.Position = UDim2.fromScale(from / span, 0)
+		block.frame.Size = UDim2.fromScale((to - from) / span, 1)
+		block.handle.Position = UDim2.fromScale(to / span, 0)
+	end
+
+	local function moveBoundaryDrag(input: InputObject)
+		local drag = dragBoundary
+		if drag == nil or input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+
+		local width = drag.track.AbsoluteSize.X
+		if width <= 0 then
+			return
+		end
+
+		local block = drag.blocks[drag.index]
+
+		--The block now runs from where it starts to wherever the mouse is, and its
+		--attribute is that length shared between however many times it loops. The
+		--floor is applied after the snap rather than before it, so that the nearest
+		--step to a very short drag cannot fall through it.
+		local at = (input.Position.X - drag.track.AbsolutePosition.X) / width * drag.span
+		local value = math.max(snapSeconds((at - block.from) / block.loops), block.minimum)
+
+		drag.value = value
+
+		--The row is laid out again as it will be once the value is written, so the
+		--rectangles follow the border rather than waiting for the button to come up.
+		--Nothing before the border moves, and because the stages run in series the
+		--blocks after it shift by whatever it gained or lost, keeping their own
+		--lengths. The axis is deliberately left as it is: rescaling it under the
+		--mouse would move the border away from the cursor dragging it, so a block
+		--taken past the end simply runs off the edge until the drag is over.
+		local shift = value * block.loops - (block.to - block.from)
+
+		for index, other in drag.blocks do
+			local from = other.from
+			local to = other.to
+
+			if index == drag.index then
+				to += shift
+			elseif index > drag.index then
+				from += shift
+				to += shift
+			end
+
+			layoutBlock(other, from, to, drag.span)
+		end
+
+		--the line sits where the border will land rather than under the mouse, so the
+		--snap is something the drag shows rather than something it does afterwards
+		showBorderHighlight(drag.highlight, (block.from + value * block.loops) / drag.span)
+	end
+
+	local function addTimelineBlock(track: Frame, text: string, fill: Color3, from: number, to: number, span: number)
+		local block = Instance.new("TextLabel")
+		block.Name = if text == "" then "Delay" else text
+		block.Position = UDim2.fromScale(from / span, 0)
+		block.Size = UDim2.fromScale((to - from) / span, 1)
+		block.BackgroundColor3 = fill
+		block.BorderSizePixel = 0
+		block.Font = Enum.Font.SourceSans
+		block.TextSize = 12
+		--the fills are deep enough to read white off in either Studio theme
+		block.TextColor3 = Color3.new(1, 1, 1)
+		block.TextTruncate = Enum.TextTruncate.AtEnd
+		block.Text = text
+		block.Parent = track
+		return block
+	end
+
+	--The right-hand border of a block, there to be grabbed: dragging it changes the
+	--length of the block to its left, which for a stage window is that stage's
+	--duration and for the gap before a stage is that stage's delay. The stages run
+	--back to back, so everything to the right of the border shifts along with it.
+	--
+	--The handle draws nothing of its own -- it only shows the row's white line --
+	--so the blocks are still drawn exactly as they were.
+	local function addBoundaryHandle(
+		track: Frame,
+		highlight: Frame,
+		emitter: Instance,
+		blocks,
+		index: number,
+		span: number
+	)
+		local block = blocks[index]
+		local alpha = block.to / span
+
+		local handle = Instance.new("TextButton")
+		handle.Name = block.attribute .. "Border"
+		handle.AnchorPoint = Vector2.new(0.5, 0)
+		handle.Position = UDim2.fromScale(alpha, 0)
+		--wide enough to be worth aiming at: BORDER_GRAB either side of the border
+		handle.Size = UDim2.new(0, BORDER_GRAB * 2 + 1, 1, 0)
+		handle.BackgroundTransparency = 1
+		handle.AutoButtonColor = false
+		handle.Text = ""
+		handle.ZIndex = 2
+		handle.Parent = track
+
+		handle.MouseEnter:Connect(function()
+			if dragBoundary == nil then
+				showBorderHighlight(highlight, alpha)
+			end
+		end)
+
+		handle.MouseLeave:Connect(function()
+			if dragBoundary == nil then
+				highlight.Visible = false
+			end
+		end)
+
+		handle.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+				return
+			end
+
+			--the whole row is carried, since dragging one border moves every block
+			--after it as well
+			dragBoundary = {
+				emitter = emitter,
+				blocks = blocks,
+				index = index,
+				track = track,
+				span = span,
+				highlight = highlight,
+				--nothing is written unless the mouse actually moves
+				value = nil,
+			}
+			showBorderHighlight(highlight, alpha)
+		end)
+
+		--the mouse leaves the handle almost at once when dragged, so the row and the
+		--window carry the drag on from here
+		handle.InputChanged:Connect(moveBoundaryDrag)
+		handle.InputEnded:Connect(endBoundaryDragOnRelease)
+
+		return handle
+	end
+
+	--One emitter's row: its name, then its stages on the shared axis. Clicking it
+	--picks that emitter, the same as picking it in the middle pane, so the rows
+	--can be used to navigate rather than only to read.
+	--Which name was clicked and when. Picking a row rebuilds every row, so the first
+	--click of a double click destroys the very label the second one lands on, and
+	--none of this can be remembered on the row itself.
+	local lastNameClick: Instance? = nil
+	local lastNameClickAt = 0
+
+	--The name becomes a field over the top of itself: same place, same text, all of
+	--it selected so that typing replaces the old name outright. Committing when the
+	--field loses focus is how the parameter fields behave too, so a name is written
+	--by pressing Return or by clicking away from it, while Escape puts the old one
+	--back. A blank name is no name at all, so it counts as leaving it alone.
+	local function beginRename(emitter: Instance, label: TextLabel)
+		local holder = label.Parent
+		if holder == nil or emitter.Parent == nil then
+			return
+		end
+
+		local box = Instance.new("TextBox")
+		box.Name = "Rename"
+		box.Position = label.Position
+		box.Size = label.Size
+		box.BackgroundColor3 = theme.inputBackground
+		box.BorderColor3 = theme.inputBorder
+		box.Font = Enum.Font.SourceSans
+		box.TextSize = TEXT_SIZE
+		box.TextColor3 = theme.text
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.ClearTextOnFocus = false
+		box.Text = emitter.Name
+		box.ZIndex = 2
+		box.Parent = holder
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 2)
+		padding.PaddingRight = UDim.new(0, 2)
+		padding.Parent = box
+
+		label.Visible = false
+
+		--a rebuild under a half-typed name would throw it away, which is the same
+		--reason the parameter fields hold redraws off while they are being typed into
+		fieldFocused = true
+
+		box.FocusLost:Connect(function(_, cause)
+			fieldFocused = false
+
+			local wanted = Fields.Trim(box.Text)
+			local cancelled = cause ~= nil and cause.KeyCode == Enum.KeyCode.Escape
+
+			if not cancelled and wanted ~= "" and wanted ~= emitter.Name and emitter.Parent ~= nil then
+				recorded(string.format("Rename %s to %s", emitter.Name, wanted), function()
+					emitter.Name = wanted
+				end)
+			end
+
+			box:Destroy()
+
+			--The rows may have been rebuilt while the name was being typed, in which
+			--case this label is gone and the one that replaced it is already showing
+			--whatever the name now is.
+			if label.Parent ~= nil then
+				label.Text = emitter.Name
+				label.Visible = true
+			end
+		end)
+
+		box:CaptureFocus()
+		box.CursorPosition = #box.Text + 1
+		box.SelectionStart = 1
+	end
+
+	local function addTimelineRow(order: number, emitter: Instance, entries, span: number, selected: boolean)
+		local row = Instance.new("TextButton")
+		row.Name = "Row"
+		row.LayoutOrder = order
+		row.Size = UDim2.new(1, 0, 0, TIMELINE_ROW_HEIGHT)
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = false
+		--the row the panes are showing is picked out, so the two halves of the
+		--window read as being about the same thing
+		row.BackgroundColor3 = if selected then theme.rowSelected else theme.background
+		row.BackgroundTransparency = if selected then 0 else 1
+		row.Text = ""
+		row.Parent = rows
+
+		if not selected then
+			row.MouseEnter:Connect(function()
+				row.BackgroundTransparency = 0
+				row.BackgroundColor3 = theme.rowHover
+			end)
+			row.MouseLeave:Connect(function()
+				row.BackgroundTransparency = 1
+			end)
+		end
+
+		--Whether the press about to activate the row landed on the name rather than on
+		--the bar. It is read off the press because a label takes no clicks of its own,
+		--and putting a button over the name instead would take the hover and the
+		--border drags off the row along with them.
+		local pressedName = false
+
+		row.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				pressedName = input.Position.X - row.AbsolutePosition.X < TIMELINE_TRACK_LEFT
+			end
+		end)
+
+		--a border being dragged is almost always dragged across the row rather than
+		--across the handle it started on, and the row takes the mouse before the
+		--window behind it does
+		row.InputChanged:Connect(moveBoundaryDrag)
+		row.InputEnded:Connect(endBoundaryDragOnRelease)
+
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Name = "Name"
+		nameLabel.Position = UDim2.fromOffset(PADDING, 0)
+		nameLabel.Size = UDim2.fromOffset(TIMELINE_NAME_WIDTH - PADDING, TIMELINE_ROW_HEIGHT)
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Font = if selected then Enum.Font.SourceSansBold else Enum.Font.SourceSans
+		nameLabel.TextSize = TEXT_SIZE
+		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+		nameLabel.TextColor3 = if selected then theme.selectedText else theme.subText
+		nameLabel.Text = emitter.Name
+		nameLabel.Parent = row
+
+		row.Activated:Connect(function()
+			local now = os.clock()
+			local again = pressedName and lastNameClick == emitter and now - lastNameClickAt <= DOUBLE_CLICK_TIME
+
+			--the first click has already picked the row, so a second one on the same
+			--name has nothing left to do but open it
+			if again then
+				lastNameClick = nil
+				beginRename(emitter, nameLabel)
+				return
+			end
+
+			lastNameClick = if pressedName then emitter else nil
+			lastNameClickAt = now
+			selectEmitter(emitter)
+		end)
+
+		local track = Instance.new("Frame")
+		track.Name = "Track"
+		track.Position = UDim2.fromOffset(TIMELINE_TRACK_LEFT, (TIMELINE_ROW_HEIGHT - TIMELINE_TRACK_HEIGHT) // 2)
+		track.Size = UDim2.new(1, -(TIMELINE_TRACK_LEFT + TIMELINE_TRACK_RIGHT), 0, TIMELINE_TRACK_HEIGHT)
+		track.BackgroundColor3 = theme.inputBackground
+		track.BorderColor3 = theme.border
+		track.ClipsDescendants = true
+		track.Parent = row
+
+		--Every block is described before any is drawn, since each one's border has to
+		--know which attribute its length belongs to and where the block begins.
+		local blocks = {}
+		local cursor = 0
+
+		for _, entry in entries do
+			local stage = entry.name:sub(1, 1):upper() .. entry.name:sub(2)
+
+			--BuildTimeline drops the delays, keeping only the windows a stage is
+			--actually playing, so each gap it left behind is that stage's delay
+			if entry.start > cursor then
+				table.insert(blocks, {
+					text = "",
+					fill = DELAY_COLOR,
+					from = cursor,
+					to = entry.start,
+					attribute = stage .. "Delay",
+					--no delay at all is a legitimate result; the block just goes away
+					minimum = 0,
+					loops = 1,
+				})
+			end
+
+			table.insert(blocks, {
+				text = if entry.loopCount > 1 then string.format("%s x%d", stage, entry.loopCount) else stage,
+				fill = STAGE_COLORS[entry.name] or theme.buttonBackground,
+				from = entry.start,
+				to = entry.finish,
+				attribute = stage .. "Duration",
+				minimum = MIN_DRAG_DURATION,
+				--a looping stage draws its window once per pass, so the attribute is a
+				--fraction of the length on screen
+				loops = entry.loopCount,
+			})
+
+			cursor = entry.finish
+		end
+
+		--the frames are kept on the descriptors so that a drag can move them without
+		--rebuilding the row, which would destroy the handle being dragged
+		for _, block in blocks do
+			block.frame = addTimelineBlock(track, block.text, block.fill, block.from, block.to, span)
+		end
+
+		--One line shared by the row's borders, since only ever one of them is under
+		--the mouse. Above the blocks, so the border reads as a line over them.
+		local highlight = Instance.new("Frame")
+		highlight.Name = "BorderHighlight"
+		highlight.AnchorPoint = Vector2.new(0.5, 0)
+		highlight.Size = UDim2.new(0, BORDER_HIGHLIGHT_WIDTH, 1, 0)
+		highlight.BorderSizePixel = 0
+		highlight.BackgroundColor3 = Color3.new(1, 1, 1)
+		highlight.ZIndex = 3
+		highlight.Visible = false
+		highlight.Parent = track
+
+		for index, block in blocks do
+			block.handle = addBoundaryHandle(track, highlight, emitter, blocks, index, span)
+		end
+	end
+
+	local function refreshTimeline()
+		for _, child in rows:GetChildren() do
+			if not child:IsA("UIListLayout") then
+				child:Destroy()
+			end
+		end
+
+		timelineSpan = 0
+		playhead.Visible = false
+		durationMark.Visible = false
+
+		local sequence = selectedSequence
+		if sequence == nil then
+			showTimelineHint("Select a sequence to see its emitters' stages.")
+			return
+		end
+
+		local emitters = collectEmitters(sequence)
+		if #emitters == 0 then
+			showTimelineHint("This sequence has no emitters.")
+			return
+		end
+
+		--One pass to resolve every emitter's stages, so they can all be laid out
+		--against the longest of them.
+		local duration = sequence:GetAttribute("Duration") or 0
+		local span = duration
+		local resolved = {}
+
+		for _, emitter in emitters do
+			local entries = Utility.BuildTimeline(readStageTimings(emitter, duration))
+			table.insert(resolved, { emitter = emitter, entries = entries })
+			if #entries > 0 then
+				--The sequence's length is what bounds playback, but a stage running
+				--past the end is still drawn rather than quietly clipped away.
+				span = math.max(span, entries[#entries].finish)
+			end
+		end
+
+		rows.Visible = true
+		overlay.Visible = true
+		startLabel.Visible = true
+		endLabel.Visible = true
+		timelineHint.Visible = false
+
+		--The rows are drawn even when there is no axis to lay them out against,
+		--because they are also the only list of the sequence's emitters: an effect
+		--with no duration authored anywhere would otherwise show nothing that could
+		--be picked, and so could not be given one.
+		local hasAxis = span > 0
+		timelineSpan = if hasAxis then span else 0
+
+		if not hasAxis then
+			startLabel.Text = "No stage on any emitter has a duration."
+			endLabel.Text = ""
+		elseif span > duration + 1e-6 then
+			--An axis longer than the sequence means stages that never get to finish,
+			--so both numbers are named and the mark shows which is which.
+			startLabel.Text = "0s"
+			endLabel.Text = string.format("%.2fs  (sequence ends %.2fs)", span, duration)
+			durationMark.Visible = duration > 0
+			durationMark.Position = UDim2.fromScale(duration / span, 0)
+		else
+			startLabel.Text = "0s"
+			endLabel.Text = string.format("%.2fs", span)
+		end
+
+		for index, item in resolved do
+			--with no axis every row is empty, so the span is then only a divisor
+			addTimelineRow(index, item.emitter, item.entries, math.max(span, 1), item.emitter == selectedEmitter)
+		end
+
+		setTimelineHeight(#resolved)
+	end
+
+	--Called every frame while an effect plays, so it moves the line and does
+	--nothing else; the rows behind it are rebuilt only when a timing changes.
+	local function setPlayhead(elapsed: number?)
+		if elapsed == nil or timelineSpan <= 0 or not rows.Visible then
+			playhead.Visible = false
+			return
+		end
+
+		local alpha = math.clamp(elapsed / timelineSpan, 0, 1)
+		playhead.Visible = true
+		--centred on the instant rather than starting at it, so the line still
+		--reads when playback is at either end of the axis
+		playhead.Position = UDim2.new(alpha, -1, 0, 0)
+	end
+
 	--one third of the window each, laid out left to right
-	local function buildPane(titleText: string, order: number)
+	local function buildPane(titleText: string, order: number, width: number)
 		local pane = Instance.new("Frame")
 		pane.Name = titleText:gsub("%s", "")
 		pane.LayoutOrder = order
-		pane.Size = UDim2.fromScale(1 / 3, 1)
+		pane.Size = UDim2.fromScale(width, 1)
 		pane.BorderSizePixel = 0
 		pane.BackgroundColor3 = theme.background
 		pane.Parent = paneHolder
@@ -389,7 +1386,7 @@ function VFXEditor.Create(plugin: Plugin)
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
 		layout.Parent = content
 
-		--right-hand divider, so the three panes read as separate columns
+		--right-hand divider, so the panes read as separate columns
 		local divider = Instance.new("Frame")
 		divider.Name = "Divider"
 		divider.AnchorPoint = Vector2.new(1, 0)
@@ -408,9 +1405,11 @@ function VFXEditor.Create(plugin: Plugin)
 		}
 	end
 
-	local sequencePane = buildPane("VFX Sequences", 1)
-	local emitterPane = buildPane("Emitters", 2)
-	local parameterPane = buildPane("Parameters", 3)
+	--There is no emitter column: the timeline's rows are the list of emitters, and
+	--picking one there is what the middle pane used to be for. The sequence list
+	--holds nothing but names, so the parameters take the rest of the width.
+	local sequencePane = buildPane("VFX Sequences", 1, 1 / 3)
+	local parameterPane = buildPane("Parameters", 2, 2 / 3)
 	--nothing sits to the right of the last pane
 	parameterPane.divider.Visible = false
 
@@ -514,7 +1513,7 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 	end
 
-	local function openDropdown(anchor: GuiObject, items)
+	function openDropdown(anchor: GuiObject, items)
 		closeDropdown()
 
 		local backdrop = Instance.new("TextButton")
@@ -905,7 +1904,7 @@ function VFXEditor.Create(plugin: Plugin)
 		return row
 	end
 
-	local refreshSequences, refreshEmitters, refreshParameters
+	local refreshSequences, refreshParameters, watchSelection
 
 	local function disconnectEmitterConnections()
 		for _, connection in emitterConnections do
@@ -934,9 +1933,97 @@ function VFXEditor.Create(plugin: Plugin)
 		end)
 	end
 
-	--keep the parameter pane live while an emitter is selected
-	local function watchSelectedEmitter()
+	--Coalesced for the same reason as the parameter pane: a bulk edit reports each
+	--attribute separately, and every one of them would otherwise rebuild every row.
+	local timelineQueued = false
+
+	local function requestTimelineRefresh()
+		if timelineQueued then
+			return
+		end
+
+		timelineQueued = true
+		task.defer(function()
+			timelineQueued = false
+			if widget.Enabled then
+				refreshTimeline()
+			end
+		end)
+	end
+
+	--Not one emitter's values but which emitters there are: a rebuild of the
+	--middle pane and of the rows, and a rewiring of the watchers so that an
+	--emitter just added is followed like the rest.
+	local emitterSetQueued = false
+
+	local function requestEmitterSetRefresh()
+		if emitterSetQueued then
+			return
+		end
+
+		emitterSetQueued = true
+		task.defer(function()
+			emitterSetQueued = false
+			if not widget.Enabled then
+				return
+			end
+
+			--an emitter that has been deleted cannot stay selected
+			if selectedEmitter ~= nil and selectedEmitter.Parent == nil then
+				selectedEmitter = nil
+				refreshParameters()
+			end
+
+			--an emitter just added to a loaded effect needs its timings filling in
+			--the same as one that was already there when the effect was loaded
+			local sequence = selectedSequence
+			if sequence ~= nil and sequence.Parent ~= nil then
+				ensureStageAttributes(sequence)
+			end
+
+			watchSelection()
+			refreshTimeline()
+		end)
+	end
+
+	--Whether an instance coming or going could change the emitter list. Attachments
+	--count whether or not they are tagged yet, since a MeshEmitter is usually
+	--parented first and tagged after, and an extra rebuild costs nothing.
+	local function affectsEmitterSet(inst: Instance): boolean
+		return inst:IsA("ParticleEmitter") or inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("Attachment")
+	end
+
+	--Keep the parameter pane and the timeline live while a selection stands. The
+	--drivers rewrite properties every heartbeat but never touch attributes, and
+	--every stage timing is an attribute, so the timeline rebuilds only on a real
+	--authoring change rather than on every frame of playback.
+	function watchSelection()
 		disconnectEmitterConnections()
+
+		local sequence = selectedSequence
+		if sequence == nil then
+			return
+		end
+
+		--the sequence's Duration sets how long the shared axis spans, and with no
+		--emitter picked the pane is showing that Duration
+		table.insert(emitterConnections, sequence.AttributeChanged:Connect(requestTimelineRefresh))
+		table.insert(emitterConnections, sequence.AttributeChanged:Connect(requestParameterRefresh))
+
+		local function onDescendant(inst: Instance)
+			if affectsEmitterSet(inst) then
+				requestEmitterSetRefresh()
+			end
+		end
+
+		table.insert(emitterConnections, sequence.DescendantAdded:Connect(onDescendant))
+		table.insert(emitterConnections, sequence.DescendantRemoving:Connect(onDescendant))
+
+		--every emitter has a row now, so every emitter's timings matter and not
+		--just those of the one the panes are showing
+		for _, emitter in collectEmitters(sequence) do
+			table.insert(emitterConnections, emitter.AttributeChanged:Connect(requestTimelineRefresh))
+		end
 
 		local emitter = selectedEmitter
 		if emitter == nil then
@@ -962,14 +2049,16 @@ function VFXEditor.Create(plugin: Plugin)
 	end
 
 	--`label` is what the pane called the row, which for a Base attribute is not
-	--its real name; the undo entry reads back as the author saw it.
-	local function commitAttribute(emitter: Instance, attributeName: string, label: string, value: any)
-		if emitter.Parent == nil then
+	--its real name; the undo entry reads back as the author saw it. Takes any
+	--instance, since the pane edits the sequence's own attributes as well as an
+	--emitter's.
+	local function commitAttribute(inst: Instance, attributeName: string, label: string, value: any)
+		if inst.Parent == nil then
 			return
 		end
 
 		recorded("Set " .. label, function()
-			emitter:SetAttribute(attributeName, value)
+			inst:SetAttribute(attributeName, value)
 		end)
 
 		requestParameterRefresh()
@@ -1000,20 +2089,66 @@ function VFXEditor.Create(plugin: Plugin)
 		closeDropdown()
 		clearPane(parameterPane)
 
-		local emitter = selectedEmitter
-		if emitter == nil or emitter.Parent == nil then
-			parameterPane.title.Text = "Parameters"
-			addLabelRow(parameterPane, 1, "Select an emitter.", theme.dimText, false)
-			return
-		end
-
-		parameterPane.title.Text = string.format("Parameters - %s", emitter.Name)
-
 		local order = 0
 		local function nextOrder()
 			order += 1
 			return order
 		end
+
+		local emitter = selectedEmitter
+		local sequence = selectedSequence
+
+		if emitter == nil or emitter.Parent == nil then
+			if sequence == nil or sequence.Parent == nil then
+				parameterPane.title.Text = "Parameters"
+				addLabelRow(parameterPane, nextOrder(), "Select a VFX sequence.", theme.dimText, false)
+				return
+			end
+
+			--With no emitter picked the pane shows the effect's own settings. That is
+			--where Duration lives, the length every stage timing is derived from, and
+			--so the one value that has to stay reachable however the timeline reads.
+			parameterPane.title.Text = string.format("Parameters - %s (Sequence)", sequence.Name)
+
+			local sequenceAttributes = sequence:GetAttributes()
+			local sequenceNames = {}
+			for attributeName in sequenceAttributes do
+				table.insert(sequenceNames, attributeName)
+			end
+			table.sort(sequenceNames)
+
+			addLabelRow(
+				parameterPane,
+				nextOrder(),
+				string.format("Attributes (%d)", #sequenceNames),
+				theme.subText,
+				true
+			)
+
+			if #sequenceNames == 0 then
+				addLabelRow(parameterPane, nextOrder(), "No attributes.", theme.dimText, false)
+			end
+
+			for _, attributeName in sequenceNames do
+				addParameterRow(nextOrder(), attributeName, sequenceAttributes[attributeName], function(edited)
+					commitAttribute(sequence, attributeName, attributeName, edited)
+				end)
+			end
+
+			--emitters are picked in the timeline now that there is no column of them
+			addLabelRow(
+				parameterPane,
+				nextOrder(),
+				"Pick an emitter in the timeline to edit its own parameters.",
+				theme.dimText,
+				false
+			)
+			return
+		end
+
+		--the class is named here because the column that used to name it is gone,
+		--and a MeshEmitter is worth telling apart from a ParticleEmitter
+		parameterPane.title.Text = string.format("Parameters - %s (%s)", emitter.Name, emitterKind(emitter))
 
 		local attributes = emitter:GetAttributes()
 		local attributeNames = {}
@@ -1082,52 +2217,32 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 	end
 
-	local function selectEmitter(emitter: Instance?)
+	--The timeline is redrawn as well as the parameters, since it is the rows that
+	--show which emitter is picked, and the toolbar because Delete Emitter acts on
+	--whatever that is.
+	function selectEmitter(emitter: Instance?)
 		selectedEmitter = emitter
-		watchSelectedEmitter()
-		refreshEmitters()
+		watchSelection()
 		refreshParameters()
-	end
-
-	function refreshEmitters()
-		clearPane(emitterPane)
-
-		local sequence = selectedSequence
-		if sequence == nil or sequence.Parent == nil then
-			emitterPane.title.Text = "Emitters"
-			addLabelRow(emitterPane, 1, "Select a VFX sequence.", theme.dimText, false)
-			return
-		end
-
-		local emitters = collectEmitters(sequence)
-		emitterPane.title.Text = string.format("Emitters (%d)", #emitters)
-
-		if #emitters == 0 then
-			addLabelRow(emitterPane, 1, "This sequence has no emitters.", theme.dimText, false)
-			return
-		end
-
-		for index, emitter in emitters do
-			addSelectableRow(
-				emitterPane,
-				index,
-				emitter.Name,
-				emitterKind(emitter),
-				emitter == selectedEmitter,
-				function()
-					selectEmitter(emitter)
-				end
-			)
-		end
+		refreshTimeline()
+		updateToolbar()
 	end
 
 	local function selectSequence(sequence: Instance?)
 		selectedSequence = sequence
 		selectedEmitter = nil
-		watchSelectedEmitter()
+
+		--Loading an effect is what fills in the timings it is missing, and it
+		--happens before the panes and the timeline are drawn so that what they show
+		--is what is now authored on the emitters.
+		if sequence ~= nil then
+			ensureStageAttributes(sequence)
+		end
+
+		watchSelection()
 		refreshSequences()
-		refreshEmitters()
 		refreshParameters()
+		refreshTimeline()
 	end
 
 	function refreshSequences()
@@ -1162,18 +2277,18 @@ function VFXEditor.Create(plugin: Plugin)
 			if not stillTagged then
 				selectedSequence = nil
 				selectedEmitter = nil
-				watchSelectedEmitter()
+				watchSelection()
 			end
 		end
 
 		if selectedEmitter ~= nil and selectedEmitter.Parent == nil then
 			selectedEmitter = nil
-			watchSelectedEmitter()
+			watchSelection()
 		end
 
 		refreshSequences()
-		refreshEmitters()
 		refreshParameters()
+		refreshTimeline()
 	end
 
 	local function applyTheme()
@@ -1183,14 +2298,32 @@ function VFXEditor.Create(plugin: Plugin)
 		toolbar.BackgroundColor3 = theme.header
 		toolbarDivider.BackgroundColor3 = theme.border
 		playTarget.TextColor3 = theme.dimText
-		stopLabel.TextColor3 = theme.buttonText
 
-		for _, button in { playButton, stopButton } do
+		tooltip.BackgroundColor3 = theme.inputBackground
+		tooltip.BorderColor3 = theme.border
+		tooltip.TextColor3 = theme.text
+
+		--the rows themselves carry their colours from creation, and refreshAll
+		--below redraws them
+		timelineBand.BackgroundColor3 = theme.header
+		playhead.BackgroundColor3 = theme.text
+		durationMark.BackgroundColor3 = theme.text
+		timelineHint.TextColor3 = theme.dimText
+		startLabel.TextColor3 = theme.dimText
+		endLabel.TextColor3 = theme.dimText
+
+		--Studio ships these two icons once per theme rather than tinting one, so they
+		--are re-pointed and not just recoloured.
+		local themeVariant = iconVariant(theme)
+		addIcon.Image = string.format(ADD_ICON, themeVariant)
+		deleteIcon.Image = string.format(DELETE_ICON, themeVariant)
+
+		for _, button in { playButton, stopButton, addButton, deleteButton } do
 			button.BackgroundColor3 = theme.buttonBackground
 			button.BorderColor3 = theme.buttonBorder
 		end
 
-		for _, pane in { sequencePane, emitterPane, parameterPane } do
+		for _, pane in { sequencePane, parameterPane } do
 			pane.pane.BackgroundColor3 = theme.background
 			pane.header.BackgroundColor3 = theme.header
 			pane.title.TextColor3 = theme.text
@@ -1202,6 +2335,21 @@ function VFXEditor.Create(plugin: Plugin)
 	end
 
 	table.insert(connections, Studio.ThemeChanged:Connect(applyTheme))
+	--a taller window can afford more timeline rows before scrolling, and a shorter
+	--one has to give the room back to the panes
+	table.insert(
+		connections,
+		root:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			setTimelineHeight(timelineRowCount)
+		end)
+	)
+	--A stage border keeps following the mouse anywhere in the window, and the drag
+	--ends wherever the button comes up. That last one is watched globally as well
+	--because a release outside the window is one the rows never hear about, and a
+	--drag left open would commit itself on some unrelated later click.
+	table.insert(connections, root.InputChanged:Connect(moveBoundaryDrag))
+	table.insert(connections, root.InputEnded:Connect(endBoundaryDragOnRelease))
+	table.insert(connections, UserInputService.InputEnded:Connect(endBoundaryDragOnRelease))
 	table.insert(
 		connections,
 		CollectionService:GetInstanceAddedSignal(VFX_SEQUENCE_TAG):Connect(function()
@@ -1218,6 +2366,25 @@ function VFXEditor.Create(plugin: Plugin)
 			end
 		end)
 	)
+	--A MeshEmitter is an Attachment that has been tagged, so tagging one that is
+	--already in the selected sequence makes it an emitter without anything being
+	--parented. The sequence's own descendant signals cannot see that.
+	for _, signal in
+		{
+			CollectionService:GetInstanceAddedSignal(MESH_EMITTER_TAG),
+			CollectionService:GetInstanceRemovedSignal(MESH_EMITTER_TAG),
+		}
+	do
+		table.insert(
+			connections,
+			signal:Connect(function(inst)
+				local sequence = selectedSequence
+				if sequence ~= nil and inst:IsDescendantOf(sequence) then
+					requestEmitterSetRefresh()
+				end
+			end)
+		)
+	end
 	table.insert(
 		connections,
 		widget:GetPropertyChangedSignal("Enabled"):Connect(function()
@@ -1252,6 +2419,17 @@ function VFXEditor.Create(plugin: Plugin)
 
 	function controller:OnStop(callback)
 		table.insert(stopCallbacks, callback)
+	end
+
+	--Where playback has reached, pushed in by whatever is running the effect:
+	--the sequence being played and its elapsed time, or nil once nothing is.
+	--Only the sequence the window is showing moves the line.
+	function controller:SetPlayhead(sequence: Instance?, elapsed: number?)
+		if sequence ~= nil and sequence == selectedSequence then
+			setPlayhead(elapsed)
+		else
+			setPlayhead(nil)
+		end
 	end
 
 	--fires whenever the window is opened or closed, including via its own close
