@@ -4,28 +4,13 @@
     "$className": "DataModel",
 
     "ReplicatedStorage": {
+      "Client": {
+        "$path": "src/ReplicatedStorage/Client"
+      },
       "Shared": {
         "$className": "Folder",
         "VFXPlayer": {
-          "$path": "src/shared/VFXPlayer",
-          "LightDriver": {
-            "$path": "src/client/LightDriver.lua"
-          },
-          "ParticleDriver": {
-            "$path": "src/client/ParticleDriver.lua"
-          },
-          "MeshParticleDriver": {
-            "$path": "src/client/MeshParticleDriver.lua"
-          },
-          "Sequence": {
-            "$path": "src/client/Sequence.lua"
-          },
-          "Utility": {
-            "$path": "src/client/Utility.lua"
-          },
-          "VFX": {
-            "$path": "src/client/VFX.lua"
-          }
+          "$path": "src/shared/VFXPlayer"
         }
       }
     },

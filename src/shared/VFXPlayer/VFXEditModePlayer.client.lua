@@ -1,13 +1,14 @@
 local toolbar = plugin:CreateToolbar("VFXPlayer")
-local CollectionService = game:GetService("CollectionService")
-local Selection = game:GetService("Selection")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 game:GetService("StarterPlayer")
 
-local playSelectionButton = toolbar:CreateButton("Play VFX", "Play the selected VFX", "rbxassetid://14978048121")
-local stopAllButton = toolbar:CreateButton("Stop All", "Stop All Playing VFX", "rbxassetid://14978048121")
-local setupButton = toolbar:CreateButton("Setup VFX", "Add Base Attributes and Tags to selected VFX Object", "rbxassetid://14978048121")
+--Play and Stop are buttons in the VFX Editor window rather than on the ribbon,
+--so that playback follows the sequence picked in the window's left pane. The
+--ribbon is left with the one button that opens that window.
+local editorButton = toolbar:CreateButton("VFX Editor", "Inspect the VFX Sequences in this place", "rbxasset://studio_svg_textures/Shared/InsertableObjects/Dark/Standard/ParticleEmitter.png")
 
-local Sequence = require(script.Parent:WaitForChild("Sequence"))
+local Sequence = require(ReplicatedStorage.Client.Systems.VFXPlayerClient.Sequence)
+local VFXEditor = require(script.Parent:WaitForChild("VFXEditor"))
 
 local activeSequences = {}
 
@@ -83,36 +84,42 @@ local function ensureBaseAttributes(model)
     end
 end
 
-local function onPlaySelectionButtonClicked()
+--play one sequence, replacing whatever was playing before
+local function onPlayRequested(sequence)
     activeSequences = {}
 
-    --find all VFXSequence tagged objects in the selection
-    for _, obj in pairs(Selection:Get()) do
-        if CollectionService:HasTag(obj, "VFXSequence") then
-            ensureBaseAttributes(obj)
-            PlaySequence(obj)
-        end
-    end
+    ensureBaseAttributes(sequence)
+    PlaySequence(sequence)
 end
 
-playSelectionButton.Click:Connect(onPlaySelectionButtonClicked)
-
-
-local function onStopAllButtonClicked()
+local function onStopRequested()
     for _,s in activeSequences do
         s:Init()
     end
     activeSequences = {}
 end
-stopAllButton.Click:Connect(onStopAllButtonClicked)
 
 
-local function onSetupButtonClicked()
-    for _, obj in pairs(Selection:Get()) do
-        print(obj.Name)
-    end
-end
-setupButton.Click:Connect(onSetupButtonClicked)
+local editor = VFXEditor.Create(plugin)
+editorButton.ClickableWhenViewportHidden = true
+editorButton:SetActive(editor:IsOpen())
+
+editorButton.Click:Connect(function()
+    editor:Toggle()
+end)
+
+editor:OnPlay(onPlayRequested)
+editor:OnStop(onStopRequested)
+
+--the window can also be closed by its own titlebar, so mirror its state rather
+--than toggling the button directly
+editor:OnOpenChanged(function(open)
+    editorButton:SetActive(open)
+end)
+
+plugin.Unloading:Connect(function()
+    editor:Destroy()
+end)
 
 
 task.spawn(function()
