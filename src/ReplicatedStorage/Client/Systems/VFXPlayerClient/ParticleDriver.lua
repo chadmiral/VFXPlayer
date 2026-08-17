@@ -22,8 +22,9 @@ local ParticleDriver = {
 	-- NumberRange attribute (Min -> fadeStart, Max -> fadeEnd)
 	fadeStart = nil,
 	fadeEnd = nil,
-	-- authored Enabled state, restored when the emitter is within FadeEnd
-	baseEnabled = true,
+	-- true while this driver is the reason the emitter is switched off, which is
+	-- what makes it safe to switch back on once within FadeEnd again
+	culled = false,
 }
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -164,10 +165,26 @@ end
 function ParticleDriver:Update(elapsedTime)
 	local fadeAlpha, distance = self:ComputeFade()
 
-	-- distance culling: turn emission off past FadeEnd, back on within FadeEnd
+	-- distance culling: turn emission off past FadeEnd, back on within FadeEnd.
+	-- Enabled belongs to the author -- it is the switch that says an emitter is not
+	-- part of the effect, and unlike every other property it has no Base attribute
+	-- standing in for it -- so it is only ever switched off here, and only switched
+	-- back on if this is what switched it off.
 	if distance ~= nil then
-		self.emitter.Enabled = self.baseEnabled and distance <= self.fadeEnd
+		if distance > self.fadeEnd then
+			if self.emitter.Enabled then
+				self.culled = true
+				self.emitter.Enabled = false
+			end
+		elseif self.culled then
+			self.culled = false
+			self.emitter.Enabled = true
+		end
 	end
+
+	-- an emitter that is switched off emits nothing, whether that is the author's
+	-- doing or the cull above
+	local off = not self.emitter.Enabled
 
 	if self.timeline == nil or #self.timeline == 0 then
 		self:HoldAtStart(fadeAlpha)
@@ -183,13 +200,17 @@ function ParticleDriver:Update(elapsedTime)
 	-- fire the current stage's burst once, when the stage first begins; the
 	-- looping Hold stage does NOT re-fire on subsequent loop iterations
 	if not frozen and entry ~= nil and entry ~= self.lastBurstEntry then
-		if entry.burstCount ~= nil then
+		-- Emit ignores Enabled, so a switched-off emitter has to be held back here
+		-- rather than left to the emitter itself. The stage still counts as burst,
+		-- so switching an emitter on part way through one does not fire a burst
+		-- that belongs to a moment already past.
+		if not off and entry.burstCount ~= nil then
 			self.emitter:Emit(entry.burstCount)
 		end
 		self.lastBurstEntry = entry
 	end
 
-	self:ApplyCurves(curves, t, frozen, fadeAlpha)
+	self:ApplyCurves(curves, t, frozen or off, fadeAlpha)
 end
 
 return ParticleDriver

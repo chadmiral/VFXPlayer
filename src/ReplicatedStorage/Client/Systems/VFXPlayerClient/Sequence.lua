@@ -111,7 +111,6 @@ local function initParticleEmitter(seq, e)
 	pd.baseSize = baseValue(e, "Size", e.Size)
 	pd.baseColor = baseValue(e, "Color", e.Color)
 	pd.baseTransparency = baseValue(e, "Transparency", e.Transparency)
-	pd.baseEnabled = e.Enabled
 
 	-- scalar multiplier applied to the base size sequence before stage size curves
 	local baseSizeMultiplier = e:GetAttribute("BaseSizeMultiplier")
@@ -216,7 +215,15 @@ local function resetParticleDrivers(seq)
 		pd.emitter.Size = pd.baseSize
 		pd.emitter.Color = pd.baseColor
 		pd.emitter.Transparency = pd.baseTransparency
-		pd.emitter.Enabled = pd.baseEnabled
+
+		--Enabled is the author's own switch rather than something the sequence
+		--animates, so the only thing to undo here is a distance cull of this
+		--driver's own making. Writing back a value captured when the sequence
+		--started would overwrite an author who reached for that switch since.
+		if pd.culled then
+			pd.culled = false
+			pd.emitter.Enabled = true
+		end
 	end
 end
 
