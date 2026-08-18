@@ -19,6 +19,11 @@ local MeshParticleDriver = {
 	rotationMin = nil, -- Vector3 of Euler angles in degrees
 	rotationMax = nil, -- Vector3 of Euler angles in degrees
 
+	-- Vector3 in studs per second, in world space, given to each particle as it
+	-- spawns. It is a launch and not a path: the particle is let go at this speed
+	-- and carries on from there, either by physics or by hand; see SpawnParticle.
+	initialVelocity = nil,
+
 	anchored = false,
 	collide = false,
 
@@ -59,6 +64,10 @@ end
 
 --advance, animate, and cull every live particle; runs once per frame
 local function stepParticles(dt)
+	-- the pull physics would be applying, for the particles the driver is moving
+	-- in its place
+	local gravityStep = Vector3.new(0, -Workspace.Gravity * dt, 0)
+
 	local i = 1
 	while i <= #activeParticles do
 		local p = activeParticles[i]
@@ -72,6 +81,14 @@ local function stepParticles(dt)
 			activeParticles[i] = activeParticles[last]
 			activeParticles[last] = nil
 		else
+			-- carried by hand only when physics is not carrying it; see SpawnParticle
+			if p.velocity ~= nil then
+				if p.falls then
+					p.velocity += gravityStep
+				end
+				p.part.CFrame += p.velocity * dt
+			end
+
 			if p.colorOverLifetime ~= nil then
 				p.part.Color = Utility.EvalColorSequence(p.colorOverLifetime, t)
 			end
@@ -112,6 +129,91 @@ function MeshParticleDriver:BeginCycle()
 	self.lastElapsed = 0
 end
 
+--randomly sample a point inside `part`, in the part's own space, spread evenly
+--through its volume rather than gathered anywhere within it
+--
+--Each of the shapes Roblox draws is sampled directly, so no point is ever picked
+--and thrown away for having landed outside the solid, and none of them crowds a
+--centre or a pole the way the obvious form of each does. Anything with no
+--interior the engine will describe -- a MeshPart, a union, a truss -- is filled
+--as the box its Size spans, which is the volume Studio itself draws around it.
+local function samplePointInPart(part)
+	local half = part.Size / 2
+
+	-- Part carries its shape in a property, while the two wedges are classes of
+	-- their own; everything else falls through to the box below.
+	local shape = nil
+	if part:IsA("Part") then
+		shape = part.Shape
+	elseif part:IsA("WedgePart") then
+		shape = Enum.PartType.Wedge
+	elseif part:IsA("CornerWedgePart") then
+		shape = Enum.PartType.CornerWedge
+	end
+
+	if shape == Enum.PartType.Ball then
+		-- A Ball is a true sphere however unevenly it is sized, taking its diameter
+		-- from its narrowest axis: the roundest volume that fits in the box.
+		local radius = math.min(half.X, half.Y, half.Z)
+		-- An even scatter over a sphere comes from a uniform height rather than a
+		-- uniform angle, which would gather at the poles. Scaling by a cube root
+		-- then spreads it through the interior, where a uniform radius would gather
+		-- at the centre: nearly all of a sphere's room is in its outer shells.
+		local height = 2 * math.random() - 1
+		local ring = math.sqrt(1 - height * height)
+		local angle = 2 * math.pi * math.random()
+		local radiusAt = radius * math.random() ^ (1 / 3)
+		return Vector3.new(radiusAt * ring * math.cos(angle), radiusAt * ring * math.sin(angle), radiusAt * height)
+	end
+
+	if shape == Enum.PartType.Cylinder then
+		-- A Cylinder lies along its X axis, and like a Ball keeps a circular section
+		-- however its other two axes are sized, taking its radius from the smaller.
+		local radius = math.min(half.Y, half.Z)
+		-- The square root spreads the points evenly across the disc; a uniform
+		-- radius would gather at the axis, since a ring's room grows as it widens.
+		local radiusAt = radius * math.sqrt(math.random())
+		local angle = 2 * math.pi * math.random()
+		return Vector3.new((2 * math.random() - 1) * half.X, radiusAt * math.cos(angle), radiusAt * math.sin(angle))
+	end
+
+	if shape == Enum.PartType.Wedge then
+		-- A Wedge stands full height across its +Z face and tapers away to the
+		-- bottom edge of -Z, so its section is the triangle where y/half.Y is at or
+		-- below z/half.Z, drawn out evenly along X.
+		--
+		-- Two uniform numbers scatter evenly over the square that triangle is half
+		-- of; folding the far half back onto the near one keeps the scatter even
+		-- while landing every point inside the wedge.
+		local u, v = math.random(), math.random()
+		if u + v > 1 then
+			u, v = 1 - u, 1 - v
+		end
+		return Vector3.new((2 * math.random() - 1) * half.X, (2 * v - 1) * half.Y, (2 * (u + v) - 1) * half.Z)
+	end
+
+	if shape == Enum.PartType.CornerWedge then
+		-- A CornerWedge is a pyramid: the whole of its -Y face for a base, rising to
+		-- a point above the one corner where +X meets -Z. Its section is that base
+		-- shrunk towards the corner as it climbs, and because it closes to nothing
+		-- rather than merely narrowing, the height is drawn from a cube root --
+		-- there is seven times as much room in the lower half as in the upper.
+		local climb = 1 - math.random() ^ (1 / 3)
+		local section = 1 - climb
+		return Vector3.new(
+			half.X - 2 * half.X * section * math.random(),
+			(2 * climb - 1) * half.Y,
+			-half.Z + 2 * half.Z * section * math.random()
+		)
+	end
+
+	return Vector3.new(
+		(2 * math.random() - 1) * half.X,
+		(2 * math.random() - 1) * half.Y,
+		(2 * math.random() - 1) * half.Z
+	)
+end
+
 --randomly sample an initial rotation between the min/max Euler angles (degrees)
 local function sampleRotation(rotationMin, rotationMax)
 	if rotationMin == nil and rotationMax == nil then
@@ -146,8 +248,22 @@ function MeshParticleDriver:SpawnParticle()
 		lifetime = 0.0001
 	end
 
-	-- spawn at the emitter's current world position with a sampled rotation
-	part.CFrame = CFrame.new(self.emitter.WorldPosition) * sampleRotation(self.rotationMin, self.rotationMax)
+	-- The part an emitter hangs off is its emission volume, so particles come from
+	-- everywhere inside it rather than all from the one point. Terrain is the one
+	-- part that is not a volume anyone means: its Size is the whole world's.
+	-- An emitter parented to anything else has only its own position to emit from.
+	local host = self.emitter.Parent
+	local origin
+	if host ~= nil and host:IsA("BasePart") and not host:IsA("Terrain") then
+		origin = host.CFrame * samplePointInPart(host)
+	else
+		origin = self.emitter.WorldPosition
+	end
+
+	-- Only the position is taken from the volume. A particle's own rotation is
+	-- sampled apart from it, so turning the emitter's part moves where particles
+	-- appear without turning the particles themselves.
+	part.CFrame = CFrame.new(origin) * sampleRotation(self.rotationMin, self.rotationMax)
 
 	-- apply the t = 0 state before parenting to avoid a one-frame pop
 	if self.sizeOverLifetime ~= nil then
@@ -162,10 +278,41 @@ function MeshParticleDriver:SpawnParticle()
 
 	part.Parent = getParticleContainer()
 
+	-- Physics moves a particle only when the simulation is running and the particle
+	-- is not anchored. Neither holds in the editor, which plays effects with the
+	-- simulation stopped, and the second never holds for an anchored particle
+	-- anywhere. So whenever physics is not going to carry the velocity, the driver
+	-- carries it instead, and an authored velocity means the same thing wherever the
+	-- effect is played.
+	local velocity = nil
+	local falls = false
+
+	if RunService:IsRunning() and not part.Anchored then
+		-- Set after parenting rather than alongside the state above: velocity
+		-- belongs to the assembly a part is part of, and a part outside the world is
+		-- not in one yet.
+		if self.initialVelocity ~= nil then
+			part.AssemblyLinearVelocity = self.initialVelocity
+		end
+	elseif not part.Anchored then
+		-- Standing in for physics rather than doing something else: this particle
+		-- would be falling if the simulation were running, so it falls here too and
+		-- the editor shows what the game will.
+		velocity = self.initialVelocity or Vector3.zero
+		falls = true
+	elseif self.initialVelocity ~= nil then
+		-- An anchored particle is never touched by physics, so its velocity is a
+		-- steady drift at the speed it was given, the same in the editor as in the
+		-- game: the way to author motion that does not fall.
+		velocity = self.initialVelocity
+	end
+
 	table.insert(activeParticles, {
 		part = part,
 		elapsed = 0,
 		lifetime = lifetime,
+		velocity = velocity,
+		falls = falls,
 		baseSize = self.baseSize,
 		colorOverLifetime = self.colorOverLifetime,
 		sizeOverLifetime = self.sizeOverLifetime,

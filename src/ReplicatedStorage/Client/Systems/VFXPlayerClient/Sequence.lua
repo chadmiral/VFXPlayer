@@ -194,6 +194,8 @@ local function initMeshEmitter(seq, a)
 	md.rotationMin = a:GetAttribute("RotationMin")
 	md.rotationMax = a:GetAttribute("RotationMax")
 
+	md.initialVelocity = a:GetAttribute("InitialVelocity")
+
 	md.anchored = a:GetAttribute("Anchored") == true
 	md.collide = a:GetAttribute("Collide") == true
 

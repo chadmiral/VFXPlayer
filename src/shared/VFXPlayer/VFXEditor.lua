@@ -11,6 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Selection = game:GetService("Selection")
 local TextService = game:GetService("TextService")
 local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 local Studio = settings().Studio
 
 local Fields = require(script.Parent:WaitForChild("VFXEditorFields"))
@@ -82,6 +83,15 @@ local STOP_ICON = "rbxassetid://579151508"
 --It ships one copy of each per theme, so the name of the theme goes in the %s.
 local ADD_ICON = "rbxasset://studio_svg_textures/Shared/Ribbon/%s/Standard/RibbonAddNoBorderSmall.png"
 local DELETE_ICON = "rbxasset://studio_svg_textures/Shared/Ribbon/%s/Standard/RibbonDeleteSmall.png"
+--and the reticle from Studio's own "Zoom to", which is the menu entry that does to
+--the Explorer's selection what this button does to the effect being edited
+local FOCUS_ICON = "rbxasset://studio_svg_textures/Shared/Navigation/%s/Standard/ZoomTo.png"
+
+--The smallest box the viewport is framed on, in studs. An effect can be made of
+--nothing that occupies space -- attachments hung off a part somewhere else, or a
+--model that is only a container -- and framing a box of no size puts the camera
+--inside it, seeing nothing at all.
+local FOCUS_MIN_EXTENT = 4
 
 --What Add Emitter offers: what the menu calls each one, the class it creates, and
 --for the mesh emitter the tag the runtime knows it by, since that is an ordinary
@@ -233,6 +243,29 @@ local function collectEmitters(sequence)
 		end
 	end
 	return emitters
+end
+
+--The box in the world that framing an effect frames: what it occupies, which for a
+--model is the same extents Studio's own F frames for a selection. A model holding
+--nothing solid reports a box of no size sitting at the world origin rather than an
+--empty one, and flying the camera to the middle of the world is not what asking to
+--see the effect means, so its pivot answers for it instead. Returns nil for an
+--effect that is nowhere in particular, which has nothing to be framed on.
+local function focusExtents(sequence: Instance): (CFrame?, Vector3?)
+	if not sequence:IsA("PVInstance") then
+		return nil, nil
+	end
+
+	if sequence:IsA("Model") then
+		local box, size = sequence:GetBoundingBox()
+		if size.Magnitude > 0 then
+			return box, size
+		end
+	elseif sequence:IsA("BasePart") then
+		return sequence.CFrame, sequence.Size
+	end
+
+	return sequence:GetPivot(), Vector3.zero
 end
 
 --Somewhere inside `sequence` that a new emitter of `kind` can live. A sequence's
@@ -418,6 +451,28 @@ local STAGE_ATTRIBUTE_PARTS = {
 	},
 }
 
+--Everything a mesh emitter is driven by, against the value its driver falls back to
+--when the attribute is absent. A mesh emitter is nothing but its attributes: unlike
+--a ParticleEmitter or a light, the Attachment it is built on has no rate or lifetime
+--or rotation of its own for the pane to show, so a parameter that is not authored is
+--one the author cannot see, let alone edit. Seeding each at its own fallback fills
+--the pane in without changing anything about how the effect plays.
+--
+--The three curves are missing here because what they fall back to is not a constant:
+--size answers to the multiplier as well, and colour and transparency to the mesh
+--being emitted. They are seeded alongside this, where those can be read.
+local MESH_EMITTER_DEFAULTS = {
+	Anchored = false,
+	BurstCount = 0,
+	Collide = false,
+	EmissionRate = 0,
+	InitialVelocity = Vector3.zero,
+	ParticleLifetime = NumberRange.new(1, 1),
+	RotationMax = Vector3.zero,
+	RotationMin = Vector3.zero,
+	SizeMultiplier = 1,
+}
+
 --What a newly added stage attribute starts at: whatever leaves playback exactly as
 --it was, so that adding one gives something to edit rather than an immediate change
 --to the effect. A scale curve of 1 multiplies a base value by itself, a white tint
@@ -512,15 +567,18 @@ local function recorded(name: string, edit: () -> ()): boolean
 	return ok
 end
 
---Author every stage timing the emitters of `sequence` are missing, so an effect
---loaded in the editor carries a full set to read and edit rather than leaving the
---runtime to fall back on values that are nowhere written down. A missing duration
+--Author every attribute the emitters of `sequence` are missing, so an effect loaded
+--in the editor carries a full set to read and edit rather than leaving the runtime
+--to fall back on values that are nowhere written down.
+--
+--Two kinds are seeded. The stage timings frame the timeline: a missing duration
 --takes an even third of the sequence's own, and a missing delay is zero, so the
---three stages run back to back and fill the sequence exactly.
+--three stages run back to back and fill the sequence exactly. Then a mesh emitter's
+--own parameters, which have nowhere but an attribute to live.
 --
 --Nothing is recorded when nothing is missing, so clicking through sequences does
 --not litter the undo history with empty waypoints.
-local function ensureStageAttributes(sequence: Instance)
+local function ensureAttributes(sequence: Instance)
 	local writes = {}
 
 	local function want(inst: Instance, name: string, value: any)
@@ -540,12 +598,14 @@ local function ensureStageAttributes(sequence: Instance)
 
 	want(sequence, "Looping", false)
 
+	local emitters = collectEmitters(sequence)
+
 	--A length that is present but unusable is left exactly as authored rather than
 	--overwritten, which leaves nothing to divide into stages.
 	if typeof(duration) == "number" and duration > 0 then
 		local share = duration / #STAGES
 
-		for _, emitter in collectEmitters(sequence) do
+		for _, emitter in emitters do
 			for _, stage in STAGES do
 				want(emitter, stage .. "Delay", 0)
 				want(emitter, stage .. "Duration", share)
@@ -554,6 +614,39 @@ local function ensureStageAttributes(sequence: Instance)
 			--not a timing, but how many times the hold window repeats; writing the
 			--value it already falls back to changes nothing beyond making it editable
 			want(emitter, "HoldLoopCount", 1)
+		end
+	end
+
+	--A mesh emitter's parameters, which unlike the timings are worth authoring
+	--whether or not the effect has a length it can be played at.
+	for _, emitter in emitters do
+		if not isMeshEmitter(emitter) then
+			continue
+		end
+
+		for name, value in MESH_EMITTER_DEFAULTS do
+			want(emitter, name, value)
+		end
+
+		--Size is a pair. The multiplier is only ever applied alongside the curve, so
+		--an emitter carrying a multiplier but no curve is emitting at its template's
+		--own size, and handing it a curve now would resize every particle by that
+		--multiplier. The curve therefore waits until the multiplier is one, which is
+		--what it has just been given wherever it was missing altogether.
+		local multiplier = emitter:GetAttribute("SizeMultiplier")
+		if multiplier == nil or multiplier == 1 then
+			want(emitter, "SizeOverParticleLifetime", NumberSequence.new(1))
+		end
+
+		--Colour and transparency start where the mesh being emitted starts, since
+		--that is exactly what a particle carries when neither attribute is there. An
+		--emitter with no template wired up yet has nothing to read them off, and is
+		--left until it has one -- which is why setting a template authors them too.
+		local objectValue = emitter:FindFirstChildOfClass("ObjectValue")
+		local template = if objectValue ~= nil then objectValue.Value else nil
+		if template ~= nil and template:IsA("BasePart") then
+			want(emitter, "ColorOverParticleLifetime", ColorSequence.new(template.Color))
+			want(emitter, "TransparencyOverParticleLifetime", NumberSequence.new(template.Transparency))
 		end
 	end
 
@@ -779,6 +872,7 @@ function VFXEditor.Create(plugin: Plugin)
 	local variant = iconVariant(theme)
 	local addButton, addIcon = makeToolbarButton("Add Emitter", 3, string.format(ADD_ICON, variant))
 	local deleteButton, deleteIcon = makeToolbarButton("Delete Emitter", 4, string.format(DELETE_ICON, variant))
+	local focusButton, focusIcon = makeToolbarButton("Focus Viewport", 5, string.format(FOCUS_ICON, variant))
 
 	--The effect being edited, picked here because everything below shows this one
 	--sequence and nothing else: the timeline is its emitters, the pane is their
@@ -892,7 +986,7 @@ function VFXEditor.Create(plugin: Plugin)
 				CollectionService:AddTag(added, kind.tag)
 			end
 			added.Parent = host
-			ensureStageAttributes(sequence)
+			ensureAttributes(sequence)
 		end)
 
 		if ok and added ~= nil then
@@ -933,6 +1027,41 @@ function VFXEditor.Create(plugin: Plugin)
 		end
 	end)
 
+	--Put the effect on screen, the way pressing F over the viewport puts the
+	--selection there. It frames the effect's root rather than the emitter the
+	--timeline has picked, since an emitter is a point inside the effect and framing
+	--one would leave the rest of it off screen. The Explorer's selection is left
+	--alone: this window has a selection of its own, and F is already there for the
+	--other one.
+	focusButton.Activated:Connect(function()
+		local sequence = selectedSequence
+		if sequence == nil or sequence.Parent == nil then
+			return
+		end
+
+		local camera = Workspace.CurrentCamera
+		if camera == nil then
+			return
+		end
+
+		local box, size = focusExtents(sequence)
+		if box == nil or size == nil then
+			return
+		end
+
+		--ZoomToExtents answers for the field of view and the shape of the viewport
+		--itself, which is what makes this frame the effect the way Studio would
+		--rather than merely point at it.
+		camera:ZoomToExtents(
+			box,
+			Vector3.new(
+				math.max(size.X, FOCUS_MIN_EXTENT),
+				math.max(size.Y, FOCUS_MIN_EXTENT),
+				math.max(size.Z, FOCUS_MIN_EXTENT)
+			)
+		)
+	end)
+
 	--A button that cannot act says so: its icon fades and it stops lighting up
 	--under the mouse.
 	local function setButtonEnabled(button: TextButton, icon: ImageLabel, enabled: boolean)
@@ -948,6 +1077,13 @@ function VFXEditor.Create(plugin: Plugin)
 		setButtonEnabled(playButton, playIcon, sequence ~= nil)
 		setButtonEnabled(addButton, addIcon, haveSequence)
 		setButtonEnabled(deleteButton, deleteIcon, selectedEmitter ~= nil)
+		--an effect that is nowhere in the world -- not a PVInstance at all -- has no
+		--place for the camera to be pointed at
+		setButtonEnabled(
+			focusButton,
+			focusIcon,
+			sequence ~= nil and sequence.Parent ~= nil and sequence:IsA("PVInstance")
+		)
 
 		--The picker names what everything below it is showing, and what the buttons
 		--beside it will act on, so with nothing picked it says to pick something
@@ -2281,7 +2417,7 @@ function VFXEditor.Create(plugin: Plugin)
 			--the same as one that was already there when the effect was loaded
 			local sequence = selectedSequence
 			if sequence ~= nil and sequence.Parent ~= nil then
-				ensureStageAttributes(sequence)
+				ensureAttributes(sequence)
 			end
 
 			watchSelection()
@@ -2384,6 +2520,13 @@ function VFXEditor.Create(plugin: Plugin)
 			end
 			objectValue.Value = value
 		end)
+
+		--The colour and transparency a particle starts at are read off the mesh, so
+		--an emitter that had no mesh to read could not be given them until now.
+		local sequence = selectedSequence
+		if sequence ~= nil and sequence.Parent ~= nil then
+			ensureAttributes(sequence)
+		end
 
 		requestParameterRefresh()
 	end
@@ -2761,7 +2904,7 @@ function VFXEditor.Create(plugin: Plugin)
 		--happens before the panes and the timeline are drawn so that what they show
 		--is what is now authored on the emitters.
 		if sequence ~= nil then
-			ensureStageAttributes(sequence)
+			ensureAttributes(sequence)
 		end
 
 		watchSelection()
@@ -2816,11 +2959,12 @@ function VFXEditor.Create(plugin: Plugin)
 		startLabel.TextColor3 = theme.dimText
 		endLabel.TextColor3 = theme.dimText
 
-		--Studio ships these two icons once per theme rather than tinting one, so they
-		--are re-pointed and not just recoloured.
+		--Studio ships these icons once per theme rather than tinting one, so they are
+		--re-pointed and not just recoloured.
 		local themeVariant = iconVariant(theme)
 		addIcon.Image = string.format(ADD_ICON, themeVariant)
 		deleteIcon.Image = string.format(DELETE_ICON, themeVariant)
+		focusIcon.Image = string.format(FOCUS_ICON, themeVariant)
 
 		for _, button in { playButton, stopButton, addButton, deleteButton } do
 			button.BackgroundColor3 = theme.buttonBackground
