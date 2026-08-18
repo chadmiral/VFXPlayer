@@ -16,6 +16,13 @@
 	is drawn as the two edges of a band around the curve and dragged by the
 	handles above and below the selected keypoint.
 
+	How tall the number plot is in the values it plots is the author's to set,
+	since VFX curves run anywhere from a few hundredths to a few hundred. It is
+	framed to the curve when the window opens, widens when something is dragged or
+	typed past an edge of it, and can be set outright in the Min and Max fields.
+	Changing it only changes what is on screen: nothing is written to the instance
+	and nothing lands on the undo stack.
+
 	Colour sequences get a picker as well, for the same reason: Studio's colour
 	dialog has no plugin API either. It is the usual saturation/value square
 	beside a hue bar, and it edits whichever keypoint is selected.
@@ -48,6 +55,9 @@ local HUE_WIDTH = 18
 --next label along
 local LABEL_GAP = 2
 local FIELD_GAP = 6
+--the Min and Max fields on the title's line, which frame the plot
+local RANGE_LABEL_WIDTH = 28
+local RANGE_BOX_WIDTH = 52
 --The bar dragged to widen a keypoint's envelope. It runs vertically, from clear
 --of the keypoint out to the edge of the band, which is the direction it is
 --dragged in and gives a whole line's worth of it to aim at.
@@ -67,6 +77,17 @@ local REMOVE_WIDTH = 66
 --keep it visible against a colour of its own kind
 local CURSOR_SIZE = 9
 local RING_WIDTH = 1
+
+--How much of the plot's own height is added beyond a value dragged or typed past
+--an edge of it, so that what has just been moved to the edge ends up inside the
+--plot rather than sitting on its border.
+local RANGE_EPSILON = 0.05
+--The span given to a curve that has no range of its own -- every keypoint at the
+--same value -- since a plot of no height can be neither read nor dragged in. One
+--is the range a NumberSequence nominally covers.
+local FLAT_RANGE_SPAN = 1
+--and the floor under a range typed in by hand, for the same reason
+local RANGE_FLOOR = 1e-4
 
 -- Roblox rejects sequences outside these bounds, so the editor never lets the
 -- keypoints leave them: at least two keypoints, at most twenty, strictly
@@ -220,24 +241,81 @@ local function buildValue(): any
 	return if isColorKind() then ColorSequence.new(points) else NumberSequence.new(points)
 end
 
--- The plot's vertical range. VFX curves are routinely well above 1 -- a Size
--- sequence is in studs -- so the plot grows to whatever the tallest keypoint
--- needs rather than clipping it off the top. Dragging is bounded by the same
--- ceiling, so raising a curve past its current peak is done by typing the value.
---
--- An envelope is measured from the top of the band it puts around a value, not
--- from the value, or a curve at the ceiling would have its envelope drawn off
--- the top of the plot.
-local function valueCeiling(): number
-	if isColorKind() then
-		return 1
+-- What the plot's height spans, and the two conversions between a value and its
+-- place on it. The range is held rather than worked out from the keypoints each
+-- time, because it is the author's to set: it is framed to the curve when the
+-- window opens, widened when something is dragged past an edge, and typed
+-- outright into the Min and Max fields.
+local function rangeSpan(): number
+	return math.max(state.rangeMax - state.rangeMin, RANGE_FLOOR)
+end
+
+local function valueToAlpha(value: number): number
+	return (value - state.rangeMin) / rangeSpan()
+end
+
+local function alphaToValue(alpha: number): number
+	return state.rangeMin + alpha * rangeSpan()
+end
+
+-- Widen the plot to take `value` in. Never narrows it: what the author has framed
+-- stays framed, and a keypoint dragged back from an edge does not drag the edge
+-- along behind it. The epsilon is what leaves the keypoint inside the plot rather
+-- than on its border, where half its marker and one of its envelope handles would
+-- be off the end.
+local function accommodate(value: number)
+	local margin = rangeSpan() * RANGE_EPSILON
+
+	if value > state.rangeMax then
+		state.rangeMax = value + margin
+	elseif value < state.rangeMin then
+		state.rangeMin = value - margin
+	end
+end
+
+-- What a curve occupies, envelopes and all, which is what the plot is framed to
+-- when it opens: VFX curves are routinely well above 1 -- a Size sequence is in
+-- studs -- and just as often well under it, so a fixed 0 to 1 box would show one
+-- squeezed into a sliver and clip the other off the top.
+local function framedRange(keypoints): (number, number)
+	local low, high = math.huge, -math.huge
+
+	for _, keypoint in keypoints do
+		local envelope = keypoint.envelope or 0
+		low = math.min(low, keypoint.value - envelope)
+		high = math.max(high, keypoint.value + envelope)
 	end
 
-	local ceiling = 1
-	for _, keypoint in state.keypoints do
-		ceiling = math.max(ceiling, keypoint.value + (keypoint.envelope or 0))
+	if low > high then
+		return 0, FLAT_RANGE_SPAN
 	end
-	return ceiling
+
+	local middle = (low + high) / 2
+
+	-- Only a curve that is genuinely flat is padded, and flatness is judged
+	-- against the size of the numbers involved rather than against 1: a curve
+	-- running 0.02 to 0.11 has a real shape, and padding it out to a unit span
+	-- would squash that shape into the bottom tenth of the plot, which is the
+	-- very thing framing is for.
+	if high - low > math.max(RANGE_FLOOR, math.abs(middle) * RANGE_FLOOR) then
+		return low, high
+	end
+
+	-- A curve with no range of its own is given one to sit in the middle of, sized
+	-- to the value it holds so that dragging it moves it by an amount worth
+	-- something: a flat 240 wants a plot hundreds tall, not the unit plot that
+	-- suits a flat 1.
+	local span = math.max(FLAT_RANGE_SPAN, math.abs(middle) * 2)
+	local padded = middle - span / 2
+
+	-- A curve which never goes negative is not framed as though it might: a flat
+	-- zero reads better along the bottom of the plot than through the middle of
+	-- one that runs below it.
+	if low >= 0 and padded < 0 then
+		return 0, span
+	end
+
+	return padded, padded + span
 end
 
 local function sampleColor(time: number): Color3
@@ -356,7 +434,9 @@ local function dragTo(index: number, time: number, value: number?)
 	end
 
 	if value ~= nil then
-		keypoint.value = math.clamp(value, 0, valueCeiling())
+		--the range is widened to take a value in before it gets here, so this
+		--bounds the value by the plot rather than the plot by the value
+		keypoint.value = math.clamp(value, state.rangeMin, state.rangeMax)
 	end
 
 	render()
@@ -369,6 +449,14 @@ end
 local function dragEnvelopeTo(index: number, value: number)
 	local keypoint = state.keypoints[index]
 	keypoint.envelope = math.abs(value - keypoint.value)
+
+	--The band is symmetrical, so widening the edge under the mouse widens the one
+	--opposite by as much, and that one can leave the plot from a keypoint sitting
+	--near the far side of it. The whole band is what the envelope means, so the
+	--whole band is kept in view.
+	accommodate(keypoint.value + keypoint.envelope)
+	accommodate(keypoint.value - keypoint.envelope)
+
 	render()
 end
 
@@ -609,9 +697,20 @@ local function build()
 
 		local position = surfaceLocalPosition(input)
 		local time = math.clamp(position.X / size.X, 0, 1)
-		local value = if isColorKind() then nil else math.clamp(1 - position.Y / size.Y, 0, 1) * valueCeiling()
+		--Allowed past the ends of the plot, because a drag carried past an edge is
+		--how the range is widened and the value has to be able to say it went
+		--there. Only just past, though: the mouse is tracked on the whole window
+		--and could be a long way outside, and how far out it strayed should not
+		--decide how far the range jumps. Each move beyond an edge asks for one
+		--epsilon more, however far beyond it the mouse actually is.
+		local alpha = math.clamp(1 - position.Y / size.Y, -RANGE_EPSILON, 1 + RANGE_EPSILON)
+		local value = if isColorKind() then nil else alphaToValue(alpha)
 
 		dragMoved = true
+
+		if value ~= nil then
+			accommodate(value)
+		end
 
 		--an envelope is dragged up and down only: it belongs to a keypoint that
 		--stays where it is
@@ -640,8 +739,46 @@ local function build()
 	local title = makeLabel(state.title, false)
 	title.Font = Enum.Font.SourceSansBold
 	title.Position = UDim2.fromOffset(PADDING, PADDING)
-	title.Size = UDim2.new(1, -PADDING * 2, 0, TITLE_HEIGHT)
 	title.Parent = root
+
+	-- The plot's own range, which says nothing about any one keypoint and so sits
+	-- up on the title's line rather than down among the fields that do. Laid out
+	-- from the right-hand edge inwards, with the title given whatever is left.
+	local titleRoom = 0
+
+	if isSequenceKind() and not isColorKind() then
+		local function placeFromRight(instance: GuiObject, width: number)
+			instance.AnchorPoint = Vector2.new(1, 0)
+			instance.Position = UDim2.new(1, -(PADDING + titleRoom), 0, PADDING)
+			instance.Size = UDim2.fromOffset(width, ROW_HEIGHT - 4)
+			instance.Parent = root
+			titleRoom += width
+		end
+
+		local function placeRangeBox(): TextBox
+			local box = makeTextBox(RANGE_BOX_WIDTH, 0)
+			placeFromRight(box, RANGE_BOX_WIDTH)
+			titleRoom += FIELD_GAP
+			return box
+		end
+
+		local function placeRangeLabel(text: string)
+			local label = makeLabel(text, true)
+			label.TextXAlignment = Enum.TextXAlignment.Right
+			placeFromRight(label, RANGE_LABEL_WIDTH)
+			titleRoom += LABEL_GAP
+		end
+
+		--right to left, so they read "Min [ ] Max [ ]" left to right
+		ui.maxBox = placeRangeBox()
+		placeRangeLabel("Max")
+		ui.minBox = placeRangeBox()
+		placeRangeLabel("Min")
+
+		titleRoom += FIELD_GAP
+	end
+
+	title.Size = UDim2.new(1, -(PADDING * 2 + titleRoom), 0, TITLE_HEIGHT)
 
 	local bottomStack = PADDING + HINT_HEIGHT + 4 + ROW_HEIGHT + PADDING
 
@@ -792,15 +929,51 @@ local function build()
 		ui.envelopeBox.FocusLost:Connect(function()
 			local parsed = tonumber(ui.envelopeBox.Text)
 			if parsed ~= nil then
-				--an envelope is a distance either way, so it has no sign; typing a
-				--bigger one than the plot shows grows the plot rather than being
-				--refused, the same as typing a value does
-				state.keypoints[state.selected].envelope = math.max(parsed, 0)
+				--an envelope is a distance either way, so it has no sign
+				local keypoint = state.keypoints[state.selected]
+				keypoint.envelope = math.max(parsed, 0)
+				--a band typed wider than the plot brings the plot with it, rather
+				--than being drawn off the end of it
+				accommodate(keypoint.value + keypoint.envelope)
+				accommodate(keypoint.value - keypoint.envelope)
 				commit()
 				return
 			end
 
 			render()
+		end)
+	end
+
+	if ui.minBox ~= nil then
+		-- The range is what the plot shows, not what the curve is, so setting it
+		-- redraws and nothing more: no write to the instance, and no entry on the
+		-- undo stack for having looked at something more closely.
+		local function commitRange(low: number, high: number)
+			if high < low then
+				low, high = high, low
+			end
+
+			state.rangeMin = low
+			state.rangeMax = math.max(high, low + RANGE_FLOOR)
+			render()
+		end
+
+		ui.minBox.FocusLost:Connect(function()
+			local parsed = tonumber(ui.minBox.Text)
+			if parsed ~= nil then
+				commitRange(parsed, state.rangeMax)
+			else
+				render()
+			end
+		end)
+
+		ui.maxBox.FocusLost:Connect(function()
+			local parsed = tonumber(ui.maxBox.Text)
+			if parsed ~= nil then
+				commitRange(state.rangeMin, parsed)
+			else
+				render()
+			end
 		end)
 	end
 
@@ -818,6 +991,10 @@ local function build()
 			local parsed = tonumber(ui.valueBox.Text)
 			if parsed ~= nil then
 				keypoint.value = math.max(parsed, 0)
+				--typed past the edge of the plot brings the plot with it, so a
+				--keypoint never goes missing for having been given an exact value
+				accommodate(keypoint.value + (keypoint.envelope or 0))
+				accommodate(keypoint.value - (keypoint.envelope or 0))
 				commit()
 				return
 			end
@@ -842,7 +1019,7 @@ local function build()
 				return
 			end
 
-			addKeypoint(position.X / size.X, (1 - position.Y / size.Y) * valueCeiling())
+			addKeypoint(position.X / size.X, alphaToValue(1 - position.Y / size.Y))
 		end)
 
 		-- The curve between the keypoints is drawn in pixels, so it has to be
@@ -937,7 +1114,6 @@ local function renderMarkers()
 	local keypoints = state.keypoints
 	local markers = ui.markerButtons
 	local size = ui.surface.AbsoluteSize
-	local ceiling = valueCeiling()
 
 	for _, segment in ui.curve:GetChildren() do
 		segment:Destroy()
@@ -962,7 +1138,7 @@ local function renderMarkers()
 
 	if not isColorKind() and size.X > 0 and size.Y > 0 then
 		local function plotY(value: number): number
-			return (1 - value / ceiling) * size.Y
+			return (1 - valueToAlpha(value)) * size.Y
 		end
 
 		for index = 1, #keypoints - 1 do
@@ -1050,7 +1226,7 @@ local function renderMarkers()
 			marker.Position = UDim2.fromScale(keypoint.time, 0.5)
 			marker.BackgroundColor3 = keypoint.color
 		else
-			marker.Position = UDim2.fromScale(keypoint.time, 1 - keypoint.value / ceiling)
+			marker.Position = UDim2.fromScale(keypoint.time, 1 - valueToAlpha(keypoint.value))
 			marker.BackgroundColor3 = color(
 				Enum.StudioStyleGuideColor.DialogMainButton,
 				if index == state.selected then Enum.StudioStyleGuideModifier.Selected else nil
@@ -1095,6 +1271,8 @@ render = function()
 	else
 		ui.valueBox.Text = string.format("%g", keypoint.value)
 		ui.envelopeBox.Text = string.format("%g", keypoint.envelope or 0)
+		ui.minBox.Text = string.format("%g", state.rangeMin)
+		ui.maxBox.Text = string.format("%g", state.rangeMax)
 	end
 
 	--the rest of the window is the keypoints and what can be done to them, none
@@ -1173,13 +1351,26 @@ function VFXSequenceEditor.Open(pluginRef: Plugin, title: string, kind: string, 
 
 	widget.Title = title
 	dragIndex = nil
+	envelopeIndex = nil
 	pickerDrag = nil
+
+	local keypoints = readKeypoints(kind, value)
+	--Framed to the curve it is about to show. A colour has no vertical range of
+	--its own, and takes the nominal one so that the conversions need no second
+	--path through for it.
+	local rangeMin, rangeMax = 0, FLAT_RANGE_SPAN
+	if kind == "numberSequence" then
+		rangeMin, rangeMax = framedRange(keypoints)
+	end
+
 	state = {
 		title = title,
 		kind = kind,
-		keypoints = readKeypoints(kind, value),
+		keypoints = keypoints,
 		selected = 1,
 		commit = onCommit,
+		rangeMin = rangeMin,
+		rangeMax = rangeMax,
 		-- White, until the first render reads the selected keypoint's colour.
 		hue = 0,
 		sat = 0,
@@ -1202,6 +1393,7 @@ function VFXSequenceEditor.Destroy()
 	state = nil
 	ui = nil
 	dragIndex = nil
+	envelopeIndex = nil
 	pickerDrag = nil
 
 	if widget ~= nil then

@@ -39,6 +39,14 @@ local PARTICLE_BASE_PROPERTIES = {
     "Color",
 }
 
+--the same for a light. Angle is left out because only a SpotLight has one, and is
+--seeded against that class alone below.
+local LIGHT_BASE_PROPERTIES = {
+    "Brightness",
+    "Range",
+    "Color",
+}
+
 --split a NumberSequence into a [0,1] normalized sequence plus the peak value it
 --was divided by, such that normalized * peak reproduces the original
 local function normalizeNumberSequence(sequence)
@@ -61,16 +69,23 @@ local function normalizeNumberSequence(sequence)
     return NumberSequence.new(keypoints), peak
 end
 
---author any missing Base attributes on the emitters of a sequence, seeding each
---one with the emitter's current native property value
+--seed one Base attribute from the property it stands in for, if it is not there
+--already. An authored value is never overwritten: the whole point of the attribute
+--is to survive playback writing over the native property.
+local function seedBaseAttribute(inst, property)
+    local attribute = "Base"..property
+    if inst:GetAttribute(attribute) == nil then
+        inst:SetAttribute(attribute, inst[property])
+    end
+end
+
+--author any missing Base attributes on the emitters and lights of a sequence,
+--seeding each one with the instance's current native property value
 local function ensureBaseAttributes(model)
     for _, d in model:GetDescendants() do
         if d:IsA("ParticleEmitter") then
             for _, property in PARTICLE_BASE_PROPERTIES do
-                local attribute = "Base"..property
-                if d:GetAttribute(attribute) == nil then
-                    d:SetAttribute(attribute, d[property])
-                end
+                seedBaseAttribute(d, property)
             end
 
             --BaseSize is stored normalized to [0,1] with the peak factored out
@@ -79,6 +94,17 @@ local function ensureBaseAttributes(model)
                 local normalized, peak = normalizeNumberSequence(d.Size)
                 d:SetAttribute("BaseSize", normalized)
                 d:SetAttribute("BaseSizeMultiplier", peak)
+            end
+
+        --the two classes Sequence:Init drives through a LightDriver, so that every
+        --light it animates has a base of its own to be animated away from
+        elseif d:IsA("PointLight") or d:IsA("SpotLight") then
+            for _, property in LIGHT_BASE_PROPERTIES do
+                seedBaseAttribute(d, property)
+            end
+
+            if d:IsA("SpotLight") then
+                seedBaseAttribute(d, "Angle")
             end
         end
     end

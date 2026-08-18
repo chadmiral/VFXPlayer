@@ -91,7 +91,10 @@ local function buildStages(inst, standDurationFallback, readCurves)
 end
 
 --resolve a base animation value: prefer a `Base<Property>` attribute override on
---the instance, otherwise fall back to the instance's native property value
+--the instance, otherwise fall back to the instance's native property value.
+--the attribute is what makes a base survive being played: a driver animates by
+--writing the native property, so on a loop restart that property holds wherever
+--the last frame left it rather than what the author asked for.
 local function baseValue(inst, property, nativeValue)
 	local override = inst:GetAttribute("Base" .. property)
 	if override ~= nil then
@@ -137,12 +140,12 @@ local function initLight(seq, l)
 	ld.light = l
 	ld.isSpotLight = l:IsA("SpotLight")
 
-	ld.baseBrightness = l.Brightness
-	ld.baseRange = l.Range
+	ld.baseBrightness = baseValue(l, "Brightness", l.Brightness)
+	ld.baseRange = baseValue(l, "Range", l.Range)
 	if ld.isSpotLight then
-		ld.baseAngle = l.Angle
+		ld.baseAngle = baseValue(l, "Angle", l.Angle)
 	end
-	ld.baseColor = l.Color
+	ld.baseColor = baseValue(l, "Color", l.Color)
 
 	local stages = buildStages(l, seq.duration, readLightStageCurves)
 	ld.timeline = Utility.BuildTimeline(stages)

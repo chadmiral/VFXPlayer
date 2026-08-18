@@ -1,7 +1,8 @@
 --Studio-only inspector window for the VFX in a place, reading top to bottom: a
 --band of playback controls, then the effect being edited, picked from everything
---tagged "VFXSequence"; then a timeline with a row per emitter inside it; then the
---native properties and attributes of whichever of those rows is selected.
+--tagged "VFXSequence"; then a timeline with a row per emitter inside it; then a pane
+--of parameters, headed by the effect's own and followed by the native properties and
+--attributes of whichever timeline row is selected.
 local VFXEditor = {}
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
@@ -157,6 +158,20 @@ local ROW_BUTTON_SIZE = ROW_HEIGHT - 6
 local SWATCH_SIZE = ROW_HEIGHT - 10
 local SWATCH_INSET = 3
 
+--Studio's own disclosure triangle, from the artwork its own collapsible sections
+--use. Drawn in white, so unlike most of Studio's icons it ships once for both themes
+--and takes whatever colour it is given -- here the heading's own text colour, so the
+--triangle and the name it belongs to read as one thing.
+local FOLD_ICON = "rbxasset://textures/collapsibleArrowRight.png"
+--the triangle at the left-hand end of a section's heading, and the gap between it
+--and the name
+local FOLD_SIZE = ROW_BUTTON_SIZE
+local FOLD_GAP = 4
+--The quarter turn that tells the two states apart. The artwork points right, which is
+--the folded one; a section standing open turns it clockwise to point down, into what
+--it has opened onto.
+local FOLD_TURN = 90
+
 --Roblox exposes no property reflection to plugins, so the native properties
 --worth showing for each driven class are enumerated here, in display order.
 --Names that do not resolve on a given instance are skipped at read time.
@@ -286,32 +301,49 @@ local function baseAttributeTarget(attributeName: string): string?
 	return string.match(attributeName, "^Base(.+)$")
 end
 
---The sections the parameter pane is divided into, in the order it shows them: what
---the timeline is made of, then the emitter's own parameters split by whether they
---vary across a particle's life, then one section per stage for what that stage
---animates. The last three are built from STAGES so that they cannot fall out of
---step with it, and so that a section's index says which stage it is for.
-local SECTION_TIMELINE = 1
-local SECTION_PARTICLE_AGE = 2
+--The sections the parameter pane is divided into, in the order it shows them: the
+--effect's own parameters, then what the timeline is made of, then the emitter's plain
+--parameters, then the ones that vary across a particle's life, then one section per
+--stage for what that stage animates. The last three are built from STAGES so that
+--they cannot fall out of step with it, and so that a section's index says which stage
+--it is for.
+--
+--The first is the effect rather than an emitter, and is the one section always
+--shown: everything under it is whatever the timeline has picked, and the effect's
+--Duration -- the length every stage timing on every emitter is derived from -- would
+--otherwise go off the screen for as long as one was picked.
+--
+--The plain parameters come before the animated ones because they are the ones read
+--and edited most: an emitter's rate and speed and texture are what it is, and the
+--curves are what it does once that is settled.
+local SECTION_SEQUENCE = 1
+local SECTION_TIMELINE = 2
 local SECTION_BASE = 3
-local SECTION_STAGE_FIRST = SECTION_BASE + 1
+local SECTION_PARTICLE_AGE = 4
+local SECTION_STAGE_FIRST = SECTION_PARTICLE_AGE + 1
 
 local SECTION_TITLES = {
+	"Sequence",
 	"Timeline",
-	"Animated Over Particle Age",
 	"Base Parameters",
+	"Animated Over Particle Age",
 }
 
 --A wash of colour behind each section, so that what kind of parameter a row is can
 --be read without looking back up to the heading it sits under. These are hues to
 --blend into the theme's own background rather than colours in their own right, so
 --that the pane stays as readable in a light theme as in a dark one.
---The first three keep well clear of the blue, green and orange the stages have
---taken; a teal for the second read too close to Stand's blue to be worth having.
+--These keep well clear of the blue, green and orange the stages have taken; a teal
+--for the particle-age section read too close to Stand's blue to be worth having.
+--
+--The effect and the timeline share the one purple, because they are the two halves
+--of the same thing: the effect's Duration is the span the timeline is drawn across,
+--and the stage timings under it are where each block falls inside that span.
 local SECTION_HUES = {
 	Color3.fromRGB(146, 108, 204),
-	Color3.fromRGB(190, 96, 150),
+	Color3.fromRGB(146, 108, 204),
 	Color3.fromRGB(148, 148, 158),
+	Color3.fromRGB(190, 96, 150),
 }
 
 --Each stage's section is named and coloured exactly as its block in the timeline
@@ -343,8 +375,10 @@ local TIMELINE_STAGE_PARTS = {
 	LoopCount = true,
 }
 
---The sequence root's own timings, which are not named after any stage: how long
---the whole effect runs for and whether it starts again afterwards.
+--Timings not named after any stage: how long the whole effect runs for and whether
+--it starts again afterwards. These belong to the sequence root, whose own attributes
+--are filed under the Sequence section without asking, so this catches an emitter
+--that carries one of the names rather than the root itself.
 local TIMELINE_ATTRIBUTES = {
 	Duration = true,
 	Looping = true,
@@ -587,6 +621,12 @@ function VFXEditor.Create(plugin: Plugin)
 
 	local selectedSequence: Instance? = nil
 	local selectedEmitter: Instance? = nil
+
+	--Which sections of the parameter pane are folded away, by section index. This is
+	--how the window is being looked at rather than anything about the effect, so it
+	--is not written anywhere and it outlives picking a different emitter: a section
+	--put away stays put away while the author works through the ones they left open.
+	local folded = {}
 
 	--Picking a sequence or an emitter redraws the pane and the timeline, all of
 	--which are built below, but the controls at the top of the window need to ask
@@ -1044,7 +1084,11 @@ function VFXEditor.Create(plugin: Plugin)
 	local function setTimelineHeight(rowCount: number)
 		timelineRowCount = rowCount
 
-		local spare = root.AbsoluteSize.Y - CONTROLS_HEIGHT - TIMELINE_AXIS_HEIGHT - TIMELINE_MIN_PANE
+		--What is left for rows once everything that is not a row has been taken off:
+		--the bands above, the axis below, the two pixels the rows are inset by, and
+		--the room the pane is always left with. Counting the inset is what keeps that
+		--last promise exact rather than a couple of pixels short.
+		local spare = root.AbsoluteSize.Y - CONTROLS_HEIGHT - (2 + TIMELINE_AXIS_HEIGHT) - TIMELINE_MIN_PANE
 		local allowed = math.clamp(spare // TIMELINE_ROW_HEIGHT, 1, TIMELINE_MAX_ROWS)
 		local visibleRows = math.clamp(rowCount, 1, allowed)
 		local height = 2 + visibleRows * TIMELINE_ROW_HEIGHT + TIMELINE_AXIS_HEIGHT
@@ -1619,8 +1663,11 @@ function VFXEditor.Create(plugin: Plugin)
 	--column of emitters nor a column of effects has anything left to say.
 	local parameterPane = buildPane("Parameters")
 
-	local function clearPane(pane)
-		for _, child in pane.content:GetChildren() do
+	--Takes the frame the rows are in rather than the pane around it, since the band
+	--of the effect's own parameters holds its rows in a frame of its own with no
+	--pane around it at all.
+	local function clearRows(content: GuiObject)
+		for _, child in content:GetChildren() do
 			if not child:IsA("UIListLayout") then
 				child:Destroy()
 			end
@@ -1628,19 +1675,19 @@ function VFXEditor.Create(plugin: Plugin)
 	end
 
 	--a non-interactive line of text, used for empty states and section titles
-	local function addLabelRow(pane, order: number, text: string, color: Color3, bold: boolean)
+	local function addLabelRow(content: GuiObject, order: number, text: string, color: Color3)
 		local label = Instance.new("TextLabel")
 		label.Name = "Label"
 		label.LayoutOrder = order
 		label.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
 		label.BackgroundTransparency = 1
-		label.Font = bold and Enum.Font.SourceSansBold or Enum.Font.SourceSans
+		label.Font = Enum.Font.SourceSans
 		label.TextSize = TEXT_SIZE
 		label.TextXAlignment = Enum.TextXAlignment.Left
 		label.TextTruncate = Enum.TextTruncate.AtEnd
 		label.TextColor3 = color
 		label.Text = text
-		label.Parent = pane.content
+		label.Parent = content
 
 		local padding = Instance.new("UIPadding")
 		padding.PaddingLeft = UDim.new(0, PADDING)
@@ -2080,14 +2127,14 @@ function VFXEditor.Create(plugin: Plugin)
 	--            label is what fits in a column, but a window opened from the row has
 	--            to say which attribute of which emitter it is editing
 	--  remove    what to do when the row's "-" is clicked; without one there is none
-	local function addParameterRow(order: number, entry)
+	local function addParameterRow(content: GuiObject, order: number, entry)
 		local row = Instance.new("Frame")
 		row.Name = "Parameter"
 		row.LayoutOrder = order
 		row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
 		row.AutomaticSize = Enum.AutomaticSize.Y
 		row.BackgroundTransparency = 1
-		row.Parent = parameterPane.content
+		row.Parent = content
 
 		local padding = Instance.new("UIPadding")
 		padding.PaddingLeft = UDim.new(0, PADDING)
@@ -2122,11 +2169,14 @@ function VFXEditor.Create(plugin: Plugin)
 		editor.BackgroundTransparency = 1
 		editor.Parent = row
 
-		--what the sequence editor puts in its titlebar, fixed now rather than at
-		--click time so a window opened from this row keeps naming this row
-		local emitter = selectedEmitter
+		--What the sequence editor puts in its titlebar, fixed now rather than at
+		--click time so a window opened from this row keeps naming this row. The
+		--instance is the row's own and not whatever the timeline has picked: the
+		--effect's parameters and one of its emitters' are on screen together, and a
+		--row of the first would otherwise claim to belong to the second.
+		local owner = entry.owner
 		local qualified = entry.fullName or entry.label
-		local title = if emitter ~= nil then emitter.Name .. "." .. qualified else qualified
+		local title = if owner ~= nil then owner.Name .. "." .. qualified else qualified
 
 		fillEditor(editor, entry.value, entry.commit, entry.kind, title)
 
@@ -2258,8 +2308,8 @@ function VFXEditor.Create(plugin: Plugin)
 			return
 		end
 
-		--the sequence's Duration sets how long the shared axis spans, and with no
-		--emitter picked the pane is showing that Duration
+		--the sequence's Duration sets how long the shared axis spans, and the pane's
+		--first section is showing that Duration whatever else it is showing
 		table.insert(emitterConnections, sequence.AttributeChanged:Connect(requestTimelineRefresh))
 		table.insert(emitterConnections, sequence.AttributeChanged:Connect(requestParameterRefresh))
 
@@ -2401,11 +2451,14 @@ function VFXEditor.Create(plugin: Plugin)
 	--menu the width of its anchor is what the other pickers want, but these names are
 	--long enough that one the width of a 16-pixel button would truncate every single
 	--one.
-	local function addStageAttributeButton(heading: TextLabel, emitter: Instance, stage: string)
+	local function addStageAttributeButton(heading: Frame, emitter: Instance, stage: string)
 		local button = makeRowButton("+", theme.text)
 		button.Name = "Add"
 		button.AnchorPoint = Vector2.new(1, 0.5)
-		button.Position = UDim2.fromScale(1, 0.5)
+		--inset by hand, since a heading row carries no padding of its own: the
+		--triangle at its other end has to be placed against the row's edge, and one
+		--padding would hold both of them off it
+		button.Position = UDim2.new(1, -PADDING, 0.5, 0)
 		button.Parent = heading
 
 		button.Activated:Connect(function()
@@ -2413,9 +2466,59 @@ function VFXEditor.Create(plugin: Plugin)
 		end)
 	end
 
+	--A section's heading: the triangle that folds the section away, its name, and how
+	--many rows are inside. Built here rather than through addLabelRow because the
+	--triangle goes to the left of the name, and a label cannot hold its own text clear
+	--of something it contains -- its UIPadding insets its children by exactly as much
+	--as it insets its text, so the two would land on top of each other.
+	local function addSectionHeading(order: number, index: number, text: string): Frame
+		local row = Instance.new("Frame")
+		row.Name = "Section"
+		row.LayoutOrder = order
+		row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
+		row.BorderSizePixel = 0
+		row.Parent = parameterPane.content
+
+		--Turned rather than swapped for a second piece of artwork: one image cannot
+		--point two ways, but it can point one way and be rotated, and a rotation is
+		--also what the eye reads as the same thing having moved rather than as one
+		--thing replacing another.
+		local arrow = Instance.new("ImageButton")
+		arrow.Name = "Fold"
+		arrow.AnchorPoint = Vector2.new(0, 0.5)
+		arrow.Position = UDim2.new(0, PADDING, 0.5, 0)
+		arrow.Size = UDim2.fromOffset(FOLD_SIZE, FOLD_SIZE)
+		arrow.BackgroundTransparency = 1
+		arrow.AutoButtonColor = false
+		arrow.Image = FOLD_ICON
+		arrow.ImageColor3 = theme.text
+		arrow.Rotation = if folded[index] then 0 else FOLD_TURN
+		arrow.Parent = row
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Title"
+		label.Position = UDim2.fromOffset(PADDING + FOLD_SIZE + FOLD_GAP, 0)
+		label.Size = UDim2.new(1, -(PADDING * 2 + FOLD_SIZE + FOLD_GAP), 1, 0)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.SourceSansBold
+		label.TextSize = TEXT_SIZE
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+		label.TextColor3 = theme.text
+		label.Text = text
+		label.Parent = row
+
+		arrow.Activated:Connect(function()
+			folded[index] = not folded[index]
+			refreshParameters()
+		end)
+
+		return row
+	end
+
 	function refreshParameters()
 		closeDropdown()
-		clearPane(parameterPane)
+		clearRows(parameterPane.content)
 
 		local order = 0
 		local function nextOrder()
@@ -2426,54 +2529,100 @@ function VFXEditor.Create(plugin: Plugin)
 		local emitter = selectedEmitter
 		local sequence = selectedSequence
 
-		if emitter == nil or emitter.Parent == nil then
-			if sequence == nil or sequence.Parent == nil then
-				parameterPane.title.Text = "Parameters"
-				addLabelRow(parameterPane, nextOrder(), "Select a VFX sequence.", theme.dimText, false)
+		--Every row is described before any is drawn, so that each can be filed under
+		--the section it belongs to whether it came from a property or an attribute.
+		local sections = {}
+		for index = 1, SECTION_COUNT do
+			sections[index] = {}
+		end
+		--sorts after anything a class names itself, which is where an attribute that
+		--stands in for no property belongs
+		local UNRANKED = math.huge
+
+		--One section: its heading, then its rows, then the colour that ties the two
+		--together. Drawn one section at a time rather than all at the end, because the
+		--first of them is the effect's own and goes in whether or not there is an
+		--emitter picked to fill the rest.
+		--
+		--An empty section is still named, since where a parameter would appear is
+		--worth knowing before there is one there: an emitter with nothing in its last
+		--section is one with no stage curves authored yet.
+		local function drawSection(index: number)
+			local entries = sections[index]
+
+			table.sort(entries, function(a, b)
+				if a.rank ~= b.rank then
+					return a.rank < b.rank
+				end
+				return a.within < b.within
+			end)
+
+			local hue = SECTION_HUES[index]
+
+			--full-strength text rather than the dimmed grey a heading would carry on
+			--the plain background: a tint costs contrast whichever way it goes, since
+			--it lightens a dark theme's background and darkens a light one's
+			local heading =
+				addSectionHeading(nextOrder(), index, string.format("%s (%d)", SECTION_TITLES[index], #entries))
+			tintRow(heading, hue, SECTION_HEADING_TINT)
+
+			--A folded section is its heading and nothing else. The count beside the
+			--name is what says how much is folded away, so a section put away still
+			--reports what is in it.
+			if folded[index] then
 				return
 			end
 
-			--With no emitter picked the pane shows the effect's own settings. That is
-			--where Duration lives, the length every stage timing is derived from, and
-			--so the one value that has to stay reachable however the timeline reads.
-			parameterPane.title.Text = string.format("Parameters - %s (Sequence)", sequence.Name)
-
-			local sequenceAttributes = sequence:GetAttributes()
-			local sequenceNames = {}
-			for attributeName in sequenceAttributes do
-				table.insert(sequenceNames, attributeName)
-			end
-			table.sort(sequenceNames)
-
-			addLabelRow(
-				parameterPane,
-				nextOrder(),
-				string.format("Attributes (%d)", #sequenceNames),
-				theme.subText,
-				true
-			)
-
-			if #sequenceNames == 0 then
-				addLabelRow(parameterPane, nextOrder(), "No attributes.", theme.dimText, false)
+			--The stage sections are the ones whose rows are authored rather than
+			--inherent in the class, and so the ones worth hanging a button off. Only
+			--while the section is open: a row added to a folded one would be added out
+			--of sight.
+			if index >= SECTION_STAGE_FIRST then
+				addStageAttributeButton(heading, emitter, STAGES[index - SECTION_STAGE_FIRST + 1])
 			end
 
-			for _, attributeName in sequenceNames do
-				addParameterRow(nextOrder(), {
-					label = attributeName,
-					value = sequenceAttributes[attributeName],
-					commit = function(edited)
-						commitAttribute(sequence, attributeName, attributeName, edited)
-					end,
-				})
+			if #entries == 0 then
+				tintRow(addLabelRow(parameterPane.content, nextOrder(), "None.", theme.dimText), hue, SECTION_TINT)
 			end
 
+			for _, entry in entries do
+				tintRow(addParameterRow(parameterPane.content, nextOrder(), entry), hue, SECTION_TINT)
+			end
+		end
+
+		if sequence == nil or sequence.Parent == nil then
+			parameterPane.title.Text = "Parameters"
+			addLabelRow(parameterPane.content, nextOrder(), "Select a VFX sequence.", theme.dimText)
+			return
+		end
+
+		--The effect's own parameters, which head the pane whatever the timeline has
+		--picked. Alphabetical, since a sequence root names nothing after a stage and
+		--has no class list of properties to take an order from.
+		for attributeName, value in sequence:GetAttributes() do
+			table.insert(sections[SECTION_SEQUENCE], {
+				label = attributeName,
+				fullName = attributeName,
+				value = value,
+				rank = UNRANKED,
+				within = attributeName,
+				owner = sequence,
+				commit = function(edited)
+					commitAttribute(sequence, attributeName, attributeName, edited)
+				end,
+			})
+		end
+
+		drawSection(SECTION_SEQUENCE)
+
+		if emitter == nil or emitter.Parent == nil then
+			parameterPane.title.Text = string.format("Parameters - %s", sequence.Name)
 			--emitters are picked in the timeline now that there is no column of them
 			addLabelRow(
-				parameterPane,
+				parameterPane.content,
 				nextOrder(),
-				"Pick an emitter in the timeline to edit its own parameters.",
-				theme.dimText,
-				false
+				"Pick an emitter in the timeline to edit its parameters.",
+				theme.dimText
 			)
 			return
 		end
@@ -2507,16 +2656,6 @@ function VFXEditor.Create(plugin: Plugin)
 				nativeRank[propertyName] = index
 			end
 		end
-
-		--Every row is described before any is drawn, so that each can be filed under
-		--the section it belongs to whether it came from a property or an attribute.
-		local sections = {}
-		for index = 1, SECTION_COUNT do
-			sections[index] = {}
-		end
-		--sorts after anything a class names itself, which is where an attribute that
-		--stands in for no property belongs
-		local UNRANKED = math.huge
 
 		local function fileRow(
 			name: string,
@@ -2557,6 +2696,7 @@ function VFXEditor.Create(plugin: Plugin)
 				kind = kind,
 				rank = rank,
 				within = within,
+				owner = emitter,
 				commit = onCommit,
 				--Only a stage's own attributes are offered a "-". A timing is what the
 				--timeline is drawn from and would be authored straight back the next
@@ -2596,44 +2736,9 @@ function VFXEditor.Create(plugin: Plugin)
 			end)
 		end
 
-		--An empty section is still named, since where a parameter would appear is
-		--worth knowing before there is one there: an emitter with nothing in its
-		--last section is one with no stage curves authored yet.
-		for index, entries in sections do
-			table.sort(entries, function(a, b)
-				if a.rank ~= b.rank then
-					return a.rank < b.rank
-				end
-				return a.within < b.within
-			end)
-
-			local hue = SECTION_HUES[index]
-
-			--full-strength text rather than the dimmed grey a heading would carry on
-			--the plain background: a tint costs contrast whichever way it goes, since
-			--it lightens a dark theme's background and darkens a light one's
-			local heading = addLabelRow(
-				parameterPane,
-				nextOrder(),
-				string.format("%s (%d)", SECTION_TITLES[index], #entries),
-				theme.text,
-				true
-			)
-			tintRow(heading, hue, SECTION_HEADING_TINT)
-
-			--the stage sections are the ones whose rows are authored rather than
-			--inherent in the class, and so the ones worth hanging a button off
-			if index >= SECTION_STAGE_FIRST then
-				addStageAttributeButton(heading, emitter, STAGES[index - SECTION_STAGE_FIRST + 1])
-			end
-
-			if #entries == 0 then
-				tintRow(addLabelRow(parameterPane, nextOrder(), "None.", theme.dimText, false), hue, SECTION_TINT)
-			end
-
-			for _, entry in entries do
-				tintRow(addParameterRow(nextOrder(), entry), hue, SECTION_TINT)
-			end
+		--the effect's own section is already drawn, above whichever emitter these are
+		for index = SECTION_TIMELINE, SECTION_COUNT do
+			drawSection(index)
 		end
 	end
 
@@ -2733,7 +2838,7 @@ function VFXEditor.Create(plugin: Plugin)
 
 	table.insert(connections, Studio.ThemeChanged:Connect(applyTheme))
 	--a taller window can afford more timeline rows before scrolling, and a shorter
-	--one has to give the room back to the panes
+	--one has to give the room back to the pane
 	table.insert(
 		connections,
 		root:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()

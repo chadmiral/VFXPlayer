@@ -9,6 +9,9 @@ local LightDriver = {
 	-- ordered stage timeline (stand -> hold -> decay); see Utility.BuildTimeline
 	timeline = nil,
 
+	-- the authored values the stage curves scale, taken from the light's
+	-- `Base<Property>` attributes and falling back to its own properties; see
+	-- Sequence.initLight. baseAngle is a SpotLight's alone.
 	baseBrightness = nil,
 	baseRange = nil,
 	baseAngle = nil,
