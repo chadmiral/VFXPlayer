@@ -27,6 +27,14 @@ local MeshParticleDriver = {
 	anchored = false,
 	collide = false,
 
+	-- A VFX sequence template, cloned and played wherever a particle strikes
+	-- something, and the collision group the particles belong to, which is what
+	-- decides through the place's own collision table what there is to strike.
+	-- Both wait on `collide`: a particle that collides with nothing to begin with
+	-- has nothing to report.
+	collisionSequence = nil, -- Model, played at the point of impact
+	collisionGroup = nil, -- string, a group registered in this place
+
 	emissionRate = 0, -- particles per second
 	burstCount = nil, -- one-shot particles emitted once when the first stage begins
 
@@ -58,8 +66,103 @@ local function getParticleContainer()
 	end
 	particleContainer = Instance.new("Folder")
 	particleContainer.Name = "VFXMeshParticles"
+	--holds nothing but particles in flight, so the place has no business saving it
+	particleContainer.Archivable = false
 	particleContainer.Parent = Workspace
 	return particleContainer
+end
+
+--a property write that can throw, so it is only ever reached through pcall;
+--see resolveCollisionGroup
+local function setCollisionGroup(part, group)
+	part.CollisionGroup = group
+end
+
+--The name of a collision group that can actually be used: the one asked for,
+--unless the place defines no such group. Naming one that does not exist throws,
+--both on a part and in a raycast, and a throw in here would take every particle
+--down with it. Each name is therefore tried once on a part of our own, and one
+--that fails falls back to Default, so a typo costs a warning and nothing more.
+local resolvedGroups = {}
+
+local function resolveCollisionGroup(group)
+	local resolved = resolvedGroups[group]
+	if resolved == nil then
+		local probe = Instance.new("Part")
+		if pcall(setCollisionGroup, probe, group) then
+			resolved = group
+		else
+			resolved = "Default"
+			warn("MeshEmitter collision group '" .. group .. "' does not exist; its particles stay in Default")
+		end
+		probe:Destroy()
+		resolvedGroups[group] = resolved
+	end
+	return resolved
+end
+
+--The test a particle's path is put to, one per collision group so that the group
+--is what decides a hit and the place's own collision table comes to govern this.
+--Respecting CanCollide narrows it further to what the particle could really
+--strike, so that a walk-through part is passed through here as well.
+--
+--Two things are never struck. Other particles, which are in the way of each other
+--constantly and are not what an effect is aimed at. And `ignore`, the part the
+--particle was emitted from: a particle begins inside its emitter's volume, so a
+--solid volume would be struck on the very first step and every effect would go
+--off at the mouth of the emitter without ever travelling anywhere.
+local collisionParamsByGroup = {}
+
+local function collisionParams(group, ignore)
+	local params = collisionParamsByGroup[group]
+	if params == nil then
+		params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.RespectCanCollide = true
+		params.CollisionGroup = group
+		collisionParamsByGroup[group] = params
+	end
+	params.FilterDescendantsInstances = { getParticleContainer(), ignore }
+	return params
+end
+
+--The frame an effect is played in where a particle struck: the effect's own up
+--axis is turned to face out of the surface, so an impact authored standing on the
+--ground lies against whatever it lands on, at whatever angle that surface sits.
+local function surfaceFrame(position, normal)
+	--any direction that is not the normal itself yields a pair of axes lying
+	--across the surface, and which pair is arbitrary: a strike has no sideways
+	local across = if math.abs(normal.Y) > 0.99 then Vector3.xAxis else Vector3.yAxis
+	return CFrame.fromMatrix(position, across:Cross(normal).Unit, normal)
+end
+
+--Whatever a particle struck over the step it has just taken, or nil. The test
+--follows the path the particle travelled rather than asking where it ended up, so
+--a fast particle cannot pass through a wall between one frame and the next.
+local function strike(p)
+	if p.collisionSequence == nil then
+		return nil
+	end
+
+	local from = p.lastPosition
+	local to = p.part.Position
+	p.lastPosition = to
+
+	local travelled = to - from
+	if travelled.Magnitude == 0 then
+		return nil
+	end
+
+	return Workspace:Raycast(from, travelled, collisionParams(p.collisionGroup, p.collisionIgnore))
+end
+
+--Play a struck particle's effect where it struck. Playing a sequence is the
+--player's job and the player is built on top of this driver, so requiring it at
+--the top of this file would be a cycle. By the time anything has been struck the
+--player is loaded, and this is no more than a lookup in the module cache.
+local function playStrike(p, result)
+	local VFXPlayerClient = require(ReplicatedStorage.Client.Systems.VFXPlayerClient)
+	VFXPlayerClient.PlayVFXOnce(p.collisionSequence, surfaceFrame(result.Position, result.Normal))
 end
 
 --advance, animate, and cull every live particle; runs once per frame
@@ -74,13 +177,9 @@ local function stepParticles(dt)
 		p.elapsed += dt
 		local t = p.elapsed / p.lifetime
 
-		if t >= 1 or p.part.Parent == nil then
-			p.part:Destroy()
-			-- swap-remove to keep culling O(1) per particle
-			local last = #activeParticles
-			activeParticles[i] = activeParticles[last]
-			activeParticles[last] = nil
-		else
+		local finished = t >= 1 or p.part.Parent == nil
+
+		if not finished then
 			-- carried by hand only when physics is not carrying it; see SpawnParticle
 			if p.velocity ~= nil then
 				if p.falls then
@@ -89,6 +188,21 @@ local function stepParticles(dt)
 				p.part.CFrame += p.velocity * dt
 			end
 
+			local struck = strike(p)
+			if struck ~= nil then
+				playStrike(p, struck)
+				-- the strike is what ends this particle, in place of its lifetime
+				finished = true
+			end
+		end
+
+		if finished then
+			p.part:Destroy()
+			-- swap-remove to keep culling O(1) per particle
+			local last = #activeParticles
+			activeParticles[i] = activeParticles[last]
+			activeParticles[last] = nil
+		else
 			if p.colorOverLifetime ~= nil then
 				p.part.Color = Utility.EvalColorSequence(p.colorOverLifetime, t)
 			end
@@ -236,9 +350,20 @@ function MeshParticleDriver:SpawnParticle()
 	local part = template:Clone()
 	part.Anchored = self.anchored
 	part.CanCollide = self.collide
-	-- particles never participate in touch/spatial queries, for efficiency
+	-- particles never participate in touch/spatial queries, for efficiency. What a
+	-- particle strikes is found by casting along its path instead, which is a test
+	-- this driver makes rather than one the engine has to make for it, and the only
+	-- kind that works in the editor, where no simulation is running to touch at all.
 	part.CanTouch = false
 	part.CanQuery = false
+
+	-- the group is worth setting whether or not anything is struck, since it is
+	-- also what governs the particle's own collisions once physics has it
+	local group = "Default"
+	if self.collisionGroup ~= nil then
+		group = resolveCollisionGroup(self.collisionGroup)
+		part.CollisionGroup = group
+	end
 
 	local lifetime = self.lifetimeMin
 	if self.lifetimeMax > self.lifetimeMin then
@@ -313,6 +438,14 @@ function MeshParticleDriver:SpawnParticle()
 		lifetime = lifetime,
 		velocity = velocity,
 		falls = falls,
+		-- An effect to play on impact is only carried when the particle can collide
+		-- at all, which is the switch the author reaches for; leaving it nil is also
+		-- what spares every other particle the cost of the test. The path is
+		-- measured from here, so the very first step is tested like any other.
+		collisionSequence = if self.collide then self.collisionSequence else nil,
+		collisionGroup = group,
+		collisionIgnore = host,
+		lastPosition = origin,
 		baseSize = self.baseSize,
 		colorOverLifetime = self.colorOverLifetime,
 		sizeOverLifetime = self.sizeOverLifetime,

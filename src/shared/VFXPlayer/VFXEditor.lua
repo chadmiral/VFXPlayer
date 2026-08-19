@@ -224,6 +224,44 @@ local function isMeshEmitter(inst)
 	return inst:IsA("Attachment") and CollectionService:HasTag(inst, MESH_EMITTER_TAG)
 end
 
+--The mesh a mesh emitter throws and the effect it plays where a particle strikes
+--something are each held by an ObjectValue child, an attribute being unable to hold
+--a reference to an instance. They are told apart by name, and these must match the
+--names the runtime reads; see Sequence.initMeshEmitter.
+local MESH_TEMPLATE_NAME = "MeshTemplate"
+local COLLISION_SEQUENCE_NAME = "CollisionSequence"
+
+local function namedObjectValue(inst: Instance, name: string): ObjectValue?
+	local found = inst:FindFirstChild(name)
+	if found ~= nil and found:IsA("ObjectValue") then
+		return found
+	end
+	return nil
+end
+
+--The mesh template, which an emitter authored before there was a second of these
+--may hold under any name at all: back then there was nothing to tell it apart
+--from, so anything that is not the impact effect still counts as one.
+local function meshTemplateValue(inst: Instance): ObjectValue?
+	local named = namedObjectValue(inst, MESH_TEMPLATE_NAME)
+	if named ~= nil then
+		return named
+	end
+
+	for _, child in inst:GetChildren() do
+		if child:IsA("ObjectValue") and child.Name ~= COLLISION_SEQUENCE_NAME then
+			return child
+		end
+	end
+
+	return nil
+end
+
+--what an ObjectValue child is pointed at, if it is there and pointed anywhere
+local function objectValueTarget(held: ObjectValue?): Instance?
+	return if held ~= nil then held.Value else nil
+end
+
 --the label shown for an emitter's type; tagged attachments read as MeshEmitter
 --rather than the less informative "Attachment"
 local function emitterKind(inst)
@@ -465,6 +503,7 @@ local MESH_EMITTER_DEFAULTS = {
 	Anchored = false,
 	BurstCount = 0,
 	Collide = false,
+	CollisionGroup = "Default",
 	EmissionRate = 0,
 	InitialVelocity = Vector3.zero,
 	ParticleLifetime = NumberRange.new(1, 1),
@@ -571,19 +610,34 @@ end
 --in the editor carries a full set to read and edit rather than leaving the runtime
 --to fall back on values that are nowhere written down.
 --
---Two kinds are seeded. The stage timings frame the timeline: a missing duration
+--Three kinds are seeded. The stage timings frame the timeline: a missing duration
 --takes an even third of the sequence's own, and a missing delay is zero, so the
 --three stages run back to back and fill the sequence exactly. Then a mesh emitter's
---own parameters, which have nowhere but an attribute to live.
+--own parameters, which have nowhere but an attribute to live. Then the references a
+--mesh emitter holds, which are children rather than attributes.
 --
 --Nothing is recorded when nothing is missing, so clicking through sequences does
 --not litter the undo history with empty waypoints.
 local function ensureAttributes(sequence: Instance)
 	local writes = {}
+	local slots = {}
 
 	local function want(inst: Instance, name: string, value: any)
 		if inst:GetAttribute(name) == nil then
 			table.insert(writes, { instance = inst, name = name, value = value })
+		end
+	end
+
+	--A reference the emitter has nowhere to keep yet. It is a child instance and not
+	--an attribute, an attribute being unable to hold a reference to an instance, and
+	--it is made empty: what it points at is the author's to choose, and an empty one
+	--reads exactly as an absent one does.
+	local function wantSlot(inst: Instance, name: string)
+		--Whatever is already under that name is left alone, ObjectValue or not.
+		--Adding a second child of the same name would only be found by chance, and
+		--would be added again every time the effect was loaded.
+		if inst:FindFirstChild(name) == nil then
+			table.insert(slots, { instance = inst, name = name })
 		end
 	end
 
@@ -628,6 +682,21 @@ local function ensureAttributes(sequence: Instance)
 			want(emitter, name, value)
 		end
 
+		--The two references a mesh emitter is built on: the mesh it throws, and the
+		--effect played where a particle strikes something. Seeding them empty puts
+		--both in the Explorer beside the parameters, so an author can see what an
+		--emitter is made of rather than having to know a reference is possible.
+		--
+		--The template waits on there being no reference at all, whatever it is
+		--named. An emitter authored before these had names of their own may keep its
+		--template under any name, and an empty one called MeshTemplate would be
+		--found first and leave that emitter throwing nothing.
+		if meshTemplateValue(emitter) == nil then
+			wantSlot(emitter, MESH_TEMPLATE_NAME)
+		end
+
+		wantSlot(emitter, COLLISION_SEQUENCE_NAME)
+
 		--Size is a pair. The multiplier is only ever applied alongside the curve, so
 		--an emitter carrying a multiplier but no curve is emitting at its template's
 		--own size, and handing it a curve now would resize every particle by that
@@ -642,21 +711,26 @@ local function ensureAttributes(sequence: Instance)
 		--that is exactly what a particle carries when neither attribute is there. An
 		--emitter with no template wired up yet has nothing to read them off, and is
 		--left until it has one -- which is why setting a template authors them too.
-		local objectValue = emitter:FindFirstChildOfClass("ObjectValue")
-		local template = if objectValue ~= nil then objectValue.Value else nil
+		local template = objectValueTarget(meshTemplateValue(emitter))
 		if template ~= nil and template:IsA("BasePart") then
 			want(emitter, "ColorOverParticleLifetime", ColorSequence.new(template.Color))
 			want(emitter, "TransparencyOverParticleLifetime", NumberSequence.new(template.Transparency))
 		end
 	end
 
-	if #writes == 0 then
+	if #writes == 0 and #slots == 0 then
 		return
 	end
 
-	recorded("Add missing VFX attributes to " .. sequence.Name, function()
+	recorded("Add missing VFX parameters to " .. sequence.Name, function()
 		for _, write in writes do
 			write.instance:SetAttribute(write.name, write.value)
+		end
+
+		for _, slot in slots do
+			local objectValue = Instance.new("ObjectValue")
+			objectValue.Name = slot.name
+			objectValue.Parent = slot.instance
 		end
 	end)
 end
@@ -2511,11 +2585,11 @@ function VFXEditor.Create(plugin: Plugin)
 			return
 		end
 
-		recorded("Set MeshTemplate", function()
-			local objectValue = emitter:FindFirstChildOfClass("ObjectValue")
+		recorded("Set " .. MESH_TEMPLATE_NAME, function()
+			local objectValue = meshTemplateValue(emitter)
 			if objectValue == nil then
 				objectValue = Instance.new("ObjectValue")
-				objectValue.Name = "MeshTemplate"
+				objectValue.Name = MESH_TEMPLATE_NAME
 				objectValue.Parent = emitter
 			end
 			objectValue.Value = value
@@ -2527,6 +2601,26 @@ function VFXEditor.Create(plugin: Plugin)
 		if sequence ~= nil and sequence.Parent ~= nil then
 			ensureAttributes(sequence)
 		end
+
+		requestParameterRefresh()
+	end
+
+	--the effect played where a particle strikes something, held the same way the
+	--mesh template is and created on demand alongside it
+	local function commitCollisionSequence(emitter: Instance, value: Instance?)
+		if emitter.Parent == nil then
+			return
+		end
+
+		recorded("Set " .. COLLISION_SEQUENCE_NAME, function()
+			local objectValue = namedObjectValue(emitter, COLLISION_SEQUENCE_NAME)
+			if objectValue == nil then
+				objectValue = Instance.new("ObjectValue")
+				objectValue.Name = COLLISION_SEQUENCE_NAME
+				objectValue.Parent = emitter
+			end
+			objectValue.Value = value
+		end)
 
 		requestParameterRefresh()
 	end
@@ -2860,13 +2954,18 @@ function VFXEditor.Create(plugin: Plugin)
 			end
 		end
 
-		--the mesh template is wired up through an ObjectValue child rather than a
-		--property, so surface it alongside the real properties
+		--the mesh a particle is made of and the effect it plays on impact are wired
+		--up through ObjectValue children rather than properties, so surface them
+		--alongside the real properties
 		if isMeshEmitter(emitter) then
-			local objectValue = emitter:FindFirstChildOfClass("ObjectValue")
-			local template = if objectValue ~= nil then objectValue.Value else nil
-			fileRow("MeshTemplate", "MeshTemplate", template, "instance", function(edited)
+			local template = objectValueTarget(meshTemplateValue(emitter))
+			fileRow(MESH_TEMPLATE_NAME, MESH_TEMPLATE_NAME, template, "instance", function(edited)
 				commitMeshTemplate(emitter, edited)
+			end)
+
+			local onCollision = objectValueTarget(namedObjectValue(emitter, COLLISION_SEQUENCE_NAME))
+			fileRow(COLLISION_SEQUENCE_NAME, COLLISION_SEQUENCE_NAME, onCollision, "instance", function(edited)
+				commitCollisionSequence(emitter, edited)
 			end)
 		end
 
